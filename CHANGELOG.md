@@ -12,6 +12,12 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Mint HTTP 429 error mapping.** When a Cashu mint returns 429
+  (rate limit), the error code is now `mint-rate-limited` with a
+  user-friendly message instead of generic
+  `payment-processing-failed`. Gonuts v0.10.0 handles retry internally
+  ([#260](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/260)).
+
 - **Lightning quote persistence: data race + crash-safety fix.**
   `persistLightningQuotes` now deep-copies `lightningQuoteRecord`
   values under the `RLock` instead of sharing pointers — eliminates a
