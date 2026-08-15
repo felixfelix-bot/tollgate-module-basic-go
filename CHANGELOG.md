@@ -18,6 +18,16 @@ and [Semantic Versioning](https://semver.org/).
   endpoint via NDS users_to_router rules. WAN-side and upstream clients
   can no longer directly probe the backend API. Defense-in-depth for
   #226 — does not change the listen address or payment flow.
+- **Unified router identity (NIP-06 + HKDF + RevealSeed).** New
+  `src/identity` module derives the router's identity stack from the
+  merchant key: a 12-word BIP39 mnemonic with NIP-06 Nostr key
+  derivation (m/44'/1237'/0'/0/0), a stable CGNAT-range IPv4,
+  per-interface MAC addresses (`br-lan`, `wlan0`, `wlan1`) and
+  root/WiFi passwords — all keyed via HKDF-SHA256 with domain
+  separation instead of raw SHA-256 hashing. Exposed through
+  `GET /identity` (public, non-sensitive view) and a loopback-only
+  `POST /identity/reveal-seed` endpoint for mnemonic recovery
+  ([#NNN](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/NNN)).
 
 ### Fixed
 
