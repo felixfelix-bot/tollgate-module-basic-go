@@ -27,7 +27,8 @@ say() { printf '\n== %s\n' "$*"; }
 die() { printf '\nFATAL: %s\n' "$*" >&2; exit 1; }
 
 say "STEP 1/7 — preflight"
-[ -f src/go.mod ] && [ -f "$TESTFILE" ] || die "run from the root of a tollgate-module-basic-go clone"
+[ -f src/go.mod ] || die "run from the root of a tollgate-module-basic-go clone"
+[ -f "$TESTFILE" ] && echo "note: $TESTFILE already present (unexpected on main base — continuing)" || echo "note: $TESTFILE not on this branch yet (expected — arrives with his branch in STEP 3)"
 command -v go >/dev/null 2>&1 || die "go not on PATH (need >= 1.25)"
 gov=$(go version | awk '{print $3}')
 echo "go: $gov   git: $(git --version)"
@@ -47,6 +48,7 @@ echo "remote tip: $tip"
 
 say "STEP 3/7 — work branch at his exact tip"
 git switch -c "$BRANCH" FETCH_HEAD 2>/dev/null || die "local branch '$BRANCH' exists — if a previous run already pushed, you are done; otherwise: git branch -D $BRANCH and rerun"
+[ -f "$TESTFILE" ] || die "$TESTFILE missing on his branch — layout changed, ping Hermes"
 
 say "STEP 4/7 — fix: loopback RemoteAddr in the 3 reveal-seed tests"
 n=$(grep -c 'req.RemoteAddr = "127.0.0.1:1234"' "$TESTFILE" || true)
