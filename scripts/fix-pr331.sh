@@ -46,8 +46,14 @@ tip=$(git rev-parse FETCH_HEAD)
 echo "remote tip: $tip"
 [ "$tip" = "$EXPECTED_TIP" ] || die "feat/identity-v2 moved (expected $EXPECTED_TIP). STOP — re-check with Hermes before pushing."
 
-say "STEP 3/7 — work branch at his exact tip"
-git switch -c "$BRANCH" FETCH_HEAD 2>/dev/null || die "local branch '$BRANCH' exists — if a previous run already pushed, you are done; otherwise: git branch -D $BRANCH and rerun"
+say "STEP 3/7 — work branch at his exact tip (idempotent: reuses + resets any earlier run's branch)"
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  echo "branch '$BRANCH' exists from an earlier run — resetting to his tip"
+  git switch "$BRANCH"
+  git reset --hard FETCH_HEAD
+else
+  git switch -c "$BRANCH" FETCH_HEAD
+fi
 [ -f "$TESTFILE" ] || die "$TESTFILE missing on his branch — layout changed, ping Hermes"
 
 say "STEP 4/7 — fix: loopback RemoteAddr in the 3 reveal-seed tests"
@@ -75,11 +81,14 @@ else
   git commit -m "fix(deps): tidy identity module dependencies"
 fi
 
-say "STEP 6/7 — gate suite (blocking: these must pass)"
+say "STEP 6/7 — gate suite (gofmt scoped to OUR diff; vet/build/test blocking)"
+mapfile -t changed < <(git diff --name-only "$EXPECTED_TIP..HEAD" -- '*.go')
+[ "${#changed[@]}" -gt 0 ] || die "no Go files changed by our commits — unexpected"
+fmt=$(gofmt -l "${changed[@]}")
+[ -z "$fmt" ] || { printf 'our changed files not gofmt-clean:\n%s\n' "$fmt"; exit 1; }
+echo "gofmt (our diff: ${changed[*]}): clean"
+echo "note: files inherited from his branch may be unformatted until the rebase — not ours, not touched (repo rule: no drive-by reformatting)"
 ( cd src
-  fmt=$(gofmt -l .)
-  [ -z "$fmt" ] || { printf 'gofmt not clean:\n%s\n' "$fmt"; exit 1; }
-  echo "gofmt: clean"
   go vet ./...
   echo "vet: ok"
   go build ./...
