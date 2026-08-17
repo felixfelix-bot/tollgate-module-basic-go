@@ -12,12 +12,38 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Deterministic network identity: NIP-06 + HKDF + RevealSeed.** New
+  `src/identity` package deriving a router's network identity from the
+  merchant key: a stable IPv4 in the RFC 6598 CGNAT range (.1 host),
+  per-interface locally-administered MACs, root and Wi-Fi passwords
+  (6-word BIP39), and a 12-word NIP-06 mnemonic
+  (m/44'/1237'/0'/0/0) with a recovery flow via `DeriveFromMnemonic`.
+  Derivations use HKDF (RFC 5869) with per-attribute domain
+  separation instead of raw hash concatenation. New additive HTTP
+  API: `GET /identity` (non-sensitive npub/IPv4/MACs) and
+  `POST /identity/reveal-seed`, which returns the key and derived
+  passwords and is loopback-only, POST-only, and body-size limited.
+  The routes degrade gracefully (not registered) when
+  `identities.json` is missing or malformed
+  ([#331](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/331)).
+
 - **Backend API firewall: port 2121 restricted to LAN interfaces.**
   New nftables include (`30-backend-firewall.nft`) blocks the backend
-  API from non-br-lan interfaces. WiFi clients still reach the payment
-  endpoint via NDS users_to_router rules. WAN-side and upstream clients
-  can no longer directly probe the backend API. Defense-in-depth for
-  #226 — does not change the listen address or payment flow.
+  API from non-br-lan interfaces (loopback allowed). WiFi clients
+  still reach the payment endpoint via NDS users_to_router rules.
+  WAN-side and upstream clients can no longer directly probe the
+  backend API. Defense-in-depth for #226 — does not change the listen
+  address or payment flow
+  ([#345](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/345)).
+
+- **Post-payment redirect with configurable auth delay.** New
+  `auth_delay_seconds` and `redirect_url` fields in the upstream Wi-Fi
+  configuration let the captive portal show a welcome page before the
+  gate opens: the valve schedules `ndsctl auth` after the configured
+  delay in a goroutine that is cancellable via `Stop()`/`CloseGate()`.
+  Ships a `welcome.html` landing page; the default of `0` keeps the
+  previous immediate-auth behavior
+  ([#200](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/200)).
 
 ### Fixed
 
@@ -33,30 +59,30 @@ and [Semantic Versioning](https://semver.org/).
   fallback). Changed to `cashu.DecodeToken()` which tries V4 then V3.
   Fixes #325.
 
+- **V2 keyset swap crash — gonuts-tollgate v0.7.4 → v0.7.6.** V2
+  keyset IDs (33 bytes) were silently truncated to 8 bytes in the
+  NUT-13 deterministic derivation path, producing a wrong secret
+  path — every swap against CDK 0.16+ mints with V2-only keysets
+  failed with "outputs have already been signed before." v0.7.6
+  hashes V2 keyset IDs before deriving the path; V1 IDs keep the
+  original behavior (NUT-13 test vectors unchanged). Also adds a
+  Cashu compatibility matrix (V3/V4 tokens × V1/V2 keysets) with
+  round-trip tests and `docs/cashu-compatibility-matrix.md`.
+  Fixes #176, fixes #257
+  ([#281](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/281)).
+
+- **V4 short keyset ID resolution — gonuts-tollgate v0.8.0.** V4 CBOR
+  short keyset IDs (8 bytes) are now resolved to full V2 keyset IDs
+  before swap requests are sent, fixing "NUT02: ID length invalid"
+  on V4+V2 token payments. Verified against V4+V1, V3+V1, and V3+V2
+  control cases
+  ([#286](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/286)).
+
 - **Mint HTTP 429 error mapping.** When a Cashu mint returns 429
   (rate limit), the error code is now `mint-rate-limited` with a
   user-friendly message instead of generic
   `payment-processing-failed`. Gonuts v0.10.0 handles retry internally
   ([#260](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/260)).
-
-- **SSRF guard on post-payment NDS session trigger.** The new
-  `triggerNdsSession()` (added for router-to-router usage tracking) now
-  validates the upstream `GatewayIP` before issuing the port-80 HTTP GET,
-  rejecting loopback, link-local, and unspecified addresses. Without this,
-  a malicious or corrupt advertisement could coax the downstream into
-  probing the local box. Also demotes the per-payment success log from
-  `Info` to `Debug` (it fires on every renewal and was noisy)
-  ([#88](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/88),
-  [#315](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/315)).
-
-- **Lightning quote persistence: data race + crash-safety fix.**
-  `persistLightningQuotes` now deep-copies `lightningQuoteRecord`
-  values under the `RLock` instead of sharing pointers — eliminates a
-  data race where `saveQuotes` read mutable fields
-  (`SessionGranted`, `Allotment`, `CompletedAt`) from shared pointers
-  after the lock was released. `saveQuotes` now calls `tmp.Sync()`
-  before `tmp.Close()` so the rename-atomicity guarantee holds on
-  power-loss. Adds 5 concurrency tests as regression guards.
 
 - **Cashu wallet swap-counter race (critical).** Bump `gonuts-tollgate`
   from v0.7.1 to v0.7.4 to pick up the fix for an unrecoverable
@@ -80,14 +106,6 @@ and [Semantic Versioning](https://semver.org/).
   ([#250](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/250),
   [#251](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/251)).
 
-- **HTTP response body reads now limited to 1 MB.** All `io.ReadAll`
-  calls on HTTP response bodies (LNURL resolve, invoice fetch, gateway
-  probes, usage tracker) now use `io.LimitReader` with a 1 MB cap,
-  matching the existing limit on the main payment handler. Prevents
-  OOM crashes on resource-constrained routers when a malicious or
-  compromised upstream service returns an oversized response
-  ([#267](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/267)).
-
 - **Lightning quote persistence across restarts.** Lightning invoice
   quotes are now persisted to disk (`quotes.json` in the wallet
   directory) so they survive process restarts. Previously all pending
@@ -99,6 +117,167 @@ and [Semantic Versioning](https://semver.org/).
   relaunched for unpaid quotes so access is granted if the invoice was
   settled while the process was down
   ([#248](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/248)).
+
+- **Lightning quote persistence: data race + crash-safety fix.**
+  `persistLightningQuotes` now deep-copies `lightningQuoteRecord`
+  values under the `RLock` instead of sharing pointers — eliminates a
+  data race where `saveQuotes` read mutable fields
+  (`SessionGranted`, `Allotment`, `CompletedAt`) from shared pointers
+  after the lock was released. `saveQuotes` now calls `tmp.Sync()`
+  before `tmp.Close()` so the rename-atomicity guarantee holds on
+  power-loss. Adds 5 concurrency tests as regression guards.
+
+- **Nil-wallet panic in `GetMintQuoteState`.**
+  `tollwallet.GetMintQuoteState()` returns an error instead of
+  panicking when called on a nil wallet
+  ([#259](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/259)).
+
+- **Degraded mode on wallet-init failure.** When the mint is
+  reachable via `/v1/info` but the keyset API returns errors, the
+  merchant now falls back to degraded mode instead of crash-looping;
+  a regression test covers the fallback path
+  ([#298](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/298),
+  [#309](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/309)).
+
+- **NDS enforcement actually gates on fw4/nftables (OpenWrt 24.10).**
+  NDS 5.0.2 inserts its enforcement chain in `ip filter FORWARD`
+  (iptables-nft), but fw4's `inet fw4 forward` chain (priority 0)
+  accepted forwarded traffic first — the NDS enforcement chain saw
+  zero packets and authenticated clients were never actually gated.
+  New `/etc/nftables.d/20-nds-enforce.nft` hooks `inet fw4 forward`
+  at priority -1 and acts on the NDS marks set in mangle PREROUTING:
+  pre-auth → drop, trusted/authed → accept, unmarked to WAN → reject
+  (forcing the captive portal). Loaded by fw4 on boot and on firewall
+  reload; survives NDS restarts. `SETUP_VERSION` bumped to `v0.5.1`
+  so a reinstall triggers the full setup
+  ([#283](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/283),
+  [#286](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/286)).
+
+- **Portable WAN detection in the NDS enforcement bridge.** WAN-side
+  interface detection no longer assumes a fixed interface name
+  ([#289](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/289),
+  [#297](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/297)).
+
+- **Router-to-router usage tracking: trigger an NDS session after
+  autopay.** After the downstream router's payment is accepted by the
+  upstream TollGate (POST to :2121), the downstream now triggers a
+  port-80 HTTP GET on the upstream so NoDogSplash creates a client
+  session — without it, `ndsctl` reported no client, usage tracking
+  always read 0, and the gate never closed when the allotment ran
+  out. The trigger validates the upstream `GatewayIP` first,
+  rejecting loopback, link-local, and unspecified addresses, so a
+  malicious or corrupt advertisement cannot coax the downstream into
+  probing the local box; the per-payment success log is demoted to
+  `Debug` (it fires on every renewal and was noisy)
+  ([#88](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/88),
+  [#315](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/315),
+  [#347](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/347)).
+
+- **AP setup recovery on reinstall/upgrade.** The
+  `99-tollgate-setup` uci-defaults script no longer bails entirely
+  when `/etc/tollgate-setup-done` exists: the flag now stores a setup
+  version and wireless verification always runs, so missing APs are
+  recreated on same-version reinstalls and the SSID is recovered from
+  existing config for consistency. Fixes #103, fixes #173
+  ([#216](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/216)).
+
+- **`/usage` spec compliance: `200` with `-1/-1` when no session.**
+  The spec requires HTTP 200 with `-1/-1` when the customer has no
+  active session; the Go binary returned 500 both when the MAC lookup
+  failed and when `GetUsage` errored. Both cases now match the spec
+  and the Rust implementation. Found by the Go/Rust parity test
+  ([#316](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/316)).
+
+- **CORS on `/usage`.** The usage endpoint was the only HTTP route
+  without `CorsMiddleware`; the handler is extracted to `HandleUsage`
+  and wrapped like every other route. The kind=21000 Nostr wrapper
+  token parsing from `POST /` is extracted into
+  `extractCashuToken()` and covered by unit tests
+  ([#195](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/195)).
+
+- **`sat` standardization + config migration.** `price_unit` is
+  standardized from `sats` to `sat` (NUT-00) across all Go files, and
+  persisted `sats` values are normalized to `sat` on load, so
+  deployed configs migrate in place. The migration no longer is
+  skipped when `profit_share` is invalid (defaults are restored and
+  the flow continues), and the advertisement now lists all configured
+  mints instead of only reachable ones, so pricing tags no longer
+  disappear from the captive portal when a mint flaps
+  ([#310](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/310)).
+
+- **Owner-first, recipient-fault-tolerant profit-share payouts.**
+  `processPayout` is redesigned: every recipient's LNURL is probed
+  first (unreachable recipients are skipped, their share stays in the
+  wallet), the owner must be reachable and paid successfully before
+  any dev-split payout, and reachable maintainers are paid
+  independently — one maintainer being offline no longer faults the
+  mint or blocks the others. Resolves #27
+  ([#168](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/168)).
+
+- **Security: TOCTOU-safe SSRF validation via custom DialContext.**
+  The LNURL-payer fetch replaces `http.Get` with an `http.Client`
+  that validates the resolved IP at TCP-dial time, closing the DNS
+  rebinding window where validation sees a public IP and the actual
+  connection dials `127.0.0.1`. Also brings the previously
+  unvalidated `/.well-known/lnurlp/` fetch under the same protection
+  ([#218](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/218),
+  [#245](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/245)).
+
+- **Security: LNURL callback URL validation.** Callback URLs from
+  Lightning Address resolution are checked for loopback, RFC 1918
+  private, link-local (including the `169.254.169.254` cloud-metadata
+  address), and unspecified addresses before the HTTP fetch, so a
+  malicious LNURL provider cannot make the router fetch internal
+  endpoints
+  ([#198](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/198)).
+
+- **Security: RFC 1918 isolation — block WiFi from upstream private
+  networks.** Authenticated WiFi clients are blocked from RFC 1918
+  ranges behind the upstream link at both the fw4 layer and the
+  NoDogSplash authenticated_users rules, so isolation holds even if
+  one layer fails
+  ([#234](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/234)).
+
+- **Security: UCI key/value validation.** `setUCIValue` rejects
+  control characters (newlines, carriage returns, null bytes) in keys
+  and values, preventing UCI config corruption and argument
+  injection. Closes #220
+  ([#222](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/222)).
+
+- **Security: config file permissions tightened from 0644 to 0600**
+  ([#221](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/221)).
+
+- **Security: sanitized error responses.** Balance and
+  Lightning-invoice JSON responses no longer echo `err.Error()` to
+  clients; internal details are logged server-side only (audit
+  finding S3)
+  ([#177](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/177),
+  [#202](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/202)).
+
+- **Security: rate limiting on the payment endpoint.** `POST /` is
+  wrapped in a token-bucket limiter (10 requests/minute per IP,
+  burst 10) that returns 429 with a `Retry-After` header, preventing
+  DoS via invalid-token spam (audit finding S1). The limit is
+  configurable via the `TOLLGATE_RATE_LIMIT_RPM` environment
+  variable for busier resellers
+  ([#177](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/177),
+  [#274](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/274),
+  [#338](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/338)).
+
+- **HTTP response body reads now limited to 1 MB.** All `io.ReadAll`
+  calls on HTTP response bodies (LNURL resolve, invoice fetch, gateway
+  probes, usage tracker) now use `io.LimitReader` with a 1 MB cap,
+  matching the existing limit on the main payment handler. Prevents
+  OOM crashes on resource-constrained routers when a malicious or
+  compromised upstream service returns an oversized response
+  ([#267](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/267),
+  [#274](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/274)).
+
+- **Security: dependency CVE sweep.** `golang.org/x/crypto`
+  v0.38.0 → v0.54.0 and `golang.org/x/net` v0.40.0 → v0.57.0,
+  clearing all 65 open Dependabot alerts (28 critical, 8 high,
+  29 medium)
+  ([#223](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/223)).
 
 - **Protocol compliance: notice event codes and tips tag.** Map
   implementation-specific notice event codes to spec-defined codes from
@@ -123,7 +302,8 @@ and [Semantic Versioning](https://semver.org/).
 - **Makefile references to deleted firewall-tollgate.** PR #196 removed
   `files/etc/config/firewall-tollgate` but two Makefile references (install
   rule + conffiles list) were left behind, breaking all package builds
-  ([#235](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/235)).
+  ([#235](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/235),
+  [#237](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/237)).
 - **Upstream gateway IP validation.** Loopback, unspecified, and
   link-local addresses are now rejected in the TollGate prober to prevent
   SSRF
@@ -143,6 +323,72 @@ and [Semantic Versioning](https://semver.org/).
   modules table and documentation list updated to reflect the full CLI
   surface
   ([#188](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/188)).
+
+- **Man pages for the full CLI.** Section-8 man pages are generated from
+  the cobra command tree (hidden `__gen-man` subcommand +
+  `scripts/gen-man-pages.sh`), committed under
+  `packaging/files/man/man8/`, and installed to `/usr/share/man/man8/`,
+  so operators can discover the CLI via `man tollgate` on the router
+  ([#187](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/187)).
+
+- **Dependency consolidation: gonuts-tollgate v0.10.0 under
+  OpenTollGate.** The gonuts module is renamed
+  `Origami74/gonuts-tollgate` → `OpenTollGate/gonuts-tollgate` and
+  bumped to v0.10.0
+  ([#304](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/304)),
+  via v0.9.0 with corrected go.sum hashes
+  ([#292](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/292),
+  [#293](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/293));
+  sub-module replace directives are aligned with the main module
+  ([#194](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/194)).
+  Shared dependencies are synced to the highest version used across all
+  14 go.mod files (Go directive 1.25.0, go-nostr v0.51.12, x/sys, x/term,
+  ln-decodepay, sonic, websocket), enforced by a new drift checker plus a
+  stale-import-path checker wired into pre-commit and CI
+  ([#307](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/307)).
+
+- **Captive-portal assets are built from source.** Minified JS/CSS is no
+  longer committed; `make portal-build` (packaging/portal-build.sh)
+  clones the portal repo, runs `npm ci && npm run build`, and copies the
+  output, with `PORTAL_REF` pinning a branch/tag/SHA. Closes #288,
+  supersedes #323
+  ([#335](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/335)).
+
+- **CLI honors `TOLLGATE_TEST_CONFIG_DIR` for the socket path**, so
+  parity tests and local development run unprivileged instead of
+  needing root for `/var/run/tollgate.sock`
+  ([#294](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/294)).
+
+- **CI/build fixes.** NIP-94 1063 release events are published directly
+  in the build step — the previous "Publish events" step piped JSON into
+  `nak` and created kind-1 notes instead of publishing the pre-signed
+  1063s
+  ([#230](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/230));
+  `GO_VERSION` bumped to 1.25 and Blossom upload errors surfaced
+  ([#244](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/244));
+  dangling firewall-tollgate references removed from the build workflow
+  and the sysupgrade keep list
+  ([#238](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/238));
+  Blossom mirror list adjusted for currently-working servers
+  ([#302](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/302),
+  [#303](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/303)).
+
+- **Docs.** The canonical TollGate protocol spec now lives in
+  OpenTollGate/tollgate; the stale local `docs/protocol/` copy is
+  deprecated and removed
+  ([#236](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/236));
+  the architecture decision that NoDogSplash port 2121 belongs in this
+  module (not tollgate-rs) is recorded
+  ([#182](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/182));
+  the "never derive secrets from public keys" anti-pattern is documented
+  in CONTRIBUTING.md
+  ([#227](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/227)).
+
+- **Chores.** `.gitignore` extended for agent/session working files
+  (`.omo/`, planning-doc patterns)
+  ([#276](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/276));
+  gofmt tab-indentation fix in `migrateConfig`
+  ([#319](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/319)).
 
 ## [v0.5.0] - 2026-07-03
 
