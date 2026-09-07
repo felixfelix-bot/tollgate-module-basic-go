@@ -48,6 +48,15 @@ and [Semantic Versioning](https://semver.org/).
   (1 KB body limit). 14 passing tests.
   ([#331](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/331))
 
+- **Vendor-IE discovery + calibrated score boost.** The WGM now reads the
+  vendor-specific Information Element from beacon frames to detect TollGate
+  APs and calibrate how likely a discovered AP is a tollgate. Vendor IE
+  encode/decode is implemented from the wire-format spec with round-trip
+  tests, an encoder overflow check runs before cast, the config schema gains
+  a `vendor_ie_discovery` field, and the discovered-AP score is boosted based
+  on cross-platform WiFi research. Rebased from #332.
+  ([#353](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/353))
+
 ### Changed
 
 - **Setup version bumped to v0.6.2.** Reinstall/upgrade now triggers a
@@ -87,6 +96,17 @@ and [Semantic Versioning](https://semver.org/).
   `payment-processing-failed` notice instead of process death or a
   misleading 30-second timeout.
   ([#360](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/360))
+
+- **Build script no longer injects the test mint into release builds.** The
+  local build script `packaging/local-build-ipk.sh` sets `cli.Version`,
+  `GitCommit`, and `BuildTime` via ldflags but never set
+  `config_manager.GitBranch`, leaving it `unknown`. Because `IsDevBuild()`
+  treated any non-`main` branch as dev, `unknown` triggered dev mode and
+  injected a test mint (with dummy invoices) into every release `.ipk`. The
+  script now passes `-X ...config_manager.GitBranch=main` in `LDFLAGS`, and
+  `IsDevBuild()` treats `unknown`/empty branches the same as `main`, so only
+  actual non-`main` branch names enable dev mode.
+  ([#359](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/359))
 
 - **Splash stub preserves query parameters on redirect.** The
   captive-portal redirect stub now appends `location.search` to the
@@ -170,10 +190,10 @@ and [Semantic Versioning](https://semver.org/).
   known TollGates across scans with signal range, sample count, and latest
   pricing. New CLI command `tollgate-cli upstream known` shows the summary.
   The `upstream scan` output now includes `is_tollgate`, `price_per_step`,
-  and `step_size` fields — **placeholders until vendor-IE discovery lands
-  (#332)**: nothing populates them yet, so `is_tollgate` logs as `false`
-  and pricing as zero values. Foundation for Phase 2 speed probing and
-  Phase 3 advertised pricing in #311.
+  and `step_size` fields — now populated since vendor-IE discovery landed in
+  #353 (see Added below): `is_tollgate` and pricing reflect real TollGate
+  APs. Foundation for Phase 2 speed probing and Phase 3 advertised pricing
+  in #311.
   ([#312](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/312))
 
 ### Fixed
