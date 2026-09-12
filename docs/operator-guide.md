@@ -240,6 +240,40 @@ Treat the output file as cash — anyone who reads a token string can
 spend it. Copy it somewhere safe and delete the plaintext once
 redeemed.
 
+### Drain funds non-interactively
+
+`--yes` (or `-y`) skips the confirmation prompt but keeps the
+plain-text output and the token file:
+
+```sh
+tollgate wallet drain cashu --yes
+```
+
+Without it the prompt reads stdin, so `ssh router 'tollgate wallet
+drain cashu'` (no terminal, no piped answer) cancels the drain. The
+exit status tells a script what happened:
+
+- `0` — drained, or there was nothing to drain.
+- `1` — the drain was attempted and failed, including a partial drain.
+- `2` — cancelled: no funds were moved.
+
+A failure on one mint never hides what another mint already drained.
+The tokens that were produced are printed and written to the file
+*before* the error is reported, the response carries a `failures` list,
+and the command still exits non-zero:
+
+```
+Partially drained 900 sats from 1 mints; 1 mint(s) failed
+...
+Mints that could NOT be drained:
+  https://mint.minibits.cash/Bitcoin/: no balance available
+```
+
+A mint that is registered twice under URLs differing only by a trailing
+slash (`.../Bitcoin` and `.../Bitcoin/`) is one mint: it is drained
+once, and the duplicate entry is reported in `merged_entries` instead of
+being drained a second time and failing.
+
 > Lightning drain (`tollgate wallet drain lightning`) is not yet
 > implemented; only `cashu` is supported.
 
@@ -485,7 +519,15 @@ tollgate --json health
 
 When the service is unreachable, `--json` output still includes a
 `success: false` object with an `error` field rather than printing
-prose to stderr, so a wrapper script can parse the failure reliably.
+prose to stderr, so a wrapper script can parse the failure reliably —
+and the process now also exits non-zero, so a script that only checks
+the exit status is not misled either.
+
+For `wallet drain cashu` specifically: a `success: false` response
+(including a partial drain) exits `1`, and any tokens that *were*
+produced are part of the JSON payload under `data.tokens` together with
+a `data.failures` list. Nothing is silently dropped. Note that `--json`
+writes no token file; use `--yes` when you want the file output.
 
 ## Troubleshooting
 

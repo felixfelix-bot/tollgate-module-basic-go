@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -254,7 +256,23 @@ func (s *CLIServer) handleWalletDrain(drainArgs []string, flags map[string]strin
 	}
 }
 
-// handleCashuDrain drains all wallet balances to Cashu tokens for each mint
+// handleCashuDrain drains every mint the wallet knows about.
+//
+// Two properties matter for fund safety (issue #375):
+//
+//  1. Registry entries that describe the same mint — a stale URL that differs
+//     only by a trailing slash, for example — are drained ONCE. Draining the
+//     second entry cannot succeed, because the first one already spent the
+//     shared proof pool, so a duplicate entry must never turn a completed
+//     drain into a failed command.
+//  2. A failure on one mint never discards what another mint already drained.
+//     Every token that was produced is part of the response, and the failures
+//     are reported alongside them, so the caller can store the funds AND see
+//     that the drain did not fully complete.
+//  3. A failing registry entry never abandons the mint. The next entry for the
+//     same mint is still tried, because the sibling entry may be the one that
+//     holds the proofs, and the FIRST failure (not the last consequence of it)
+//     is what gets reported.
 func (s *CLIServer) handleCashuDrain(flags map[string]string) CLIResponse {
 	m := s.merchantProvider.GetMerchant()
 	if m == nil {
@@ -276,77 +294,139 @@ func (s *CLIServer) handleCashuDrain(flags map[string]string) CLIResponse {
 		}
 	}
 
+	groups := groupMintEntries(allMintBalances)
+
 	var tokens []CashuToken
 	var totalDrained uint64
+	var failures []MintDrainFailure
+	var mergedEntries []string
 
-	// For each mint in the wallet, drain if balance > 0
-	for mintURL, balance := range allMintBalances {
+	for _, group := range groups {
+		// firstErr is the error of the FIRST entry that failed. Reporting the
+		// first failure rather than the last keeps the message pointed at the
+		// root cause: with a duplicate registry entry every later entry fails
+		// with "no balance available" as a *consequence* of the first failure,
+		// and that consequence would otherwise mask the real error.
+		var firstErr error
+		failedEntries := 0
+		drainedEntry := ""
 
-		if balance == 0 {
-			cliLogger.WithField("mint", mintURL).Debug("Skipping mint with zero balance")
+		// Drain each mint exactly once. Entries within a group wrap the same
+		// mint, so the first entry that yields a token wins and the rest are
+		// recorded as merged instead of being drained again. A failing entry is
+		// not fatal for the group — a sibling entry for the same mint may still
+		// hold the funds — so the loop moves on to the next entry.
+		for _, entry := range group.entries {
+			if allMintBalances[entry] == 0 {
+				cliLogger.WithField("mint", entry).Debug("Skipping mint with zero balance")
+				continue
+			}
+
+			// Use DrainMint instead of CreatePaymentToken to avoid fee-related issues
+			// DrainMint extracts all available balance without trying to add fees
+			tokenString, actualAmount, err := m.DrainMint(entry)
+			if err == nil && (tokenString == "" || actualAmount == 0) {
+				// A swap that reports success but hands back no token would be a
+				// funds-loss trap if taken at face value: the mint would count as
+				// drained and every sibling entry would be skipped. Treat it as a
+				// failure and try the next entry instead.
+				err = fmt.Errorf("mint returned no token for %d sats of available balance", allMintBalances[entry])
+			}
+			if err != nil {
+				failedEntries++
+				if firstErr == nil {
+					firstErr = err
+				}
+				cliLogger.WithFields(logrus.Fields{
+					"mint":    entry,
+					"balance": allMintBalances[entry],
+					"error":   err,
+				}).Warn("Failed to drain mint entry")
+				continue
+			}
+
+			tokens = append(tokens, CashuToken{
+				MintURL: entry,
+				Balance: actualAmount,
+				Token:   tokenString,
+			})
+			totalDrained += actualAmount
+			drainedEntry = entry
+
+			cliLogger.WithFields(logrus.Fields{
+				"mint":    entry,
+				"balance": actualAmount,
+			}).Info("Created drain token")
+			break
+		}
+
+		if drainedEntry != "" {
+			for _, entry := range group.entries {
+				if entry == drainedEntry || allMintBalances[entry] == 0 {
+					continue
+				}
+				mergedEntries = append(mergedEntries, entry)
+				cliLogger.WithFields(logrus.Fields{
+					"mint":    entry,
+					"drained": drainedEntry,
+				}).Info("Merged duplicate mint registry entry into one drain")
+			}
 			continue
 		}
 
-		// Use DrainMint instead of CreatePaymentToken to avoid fee-related issues
-		// DrainMint extracts all available balance without trying to add fees
-		tokenString, actualAmount, err := m.DrainMint(mintURL)
-		if err != nil {
-			cliLogger.WithFields(logrus.Fields{
-				"mint":    mintURL,
-				"balance": balance,
-				"error":   err,
-			}).Error("Failed to drain mint")
-
-			return CLIResponse{
-				Success:   false,
-				Error:     fmt.Sprintf("Failed to drain mint %s: %v", mintURL, err),
-				Timestamp: time.Now(),
-			}
+		// Nothing was drained for this mint: every entry either had zero
+		// balance or failed. firstErr carries the first real failure.
+		if firstErr == nil {
+			continue
 		}
 
-		tokens = append(tokens, CashuToken{
-			MintURL: mintURL,
-			Balance: actualAmount,
-			Token:   tokenString,
-		})
-
-		totalDrained += actualAmount
+		errText := firstErr.Error()
+		if failedEntries > 1 {
+			errText = fmt.Sprintf("%s (%d registry entries for this mint failed; first error shown)", errText, failedEntries)
+		}
 
 		cliLogger.WithFields(logrus.Fields{
-			"mint":    mintURL,
-			"balance": actualAmount,
-		}).Info("Created drain token")
+			"mint":  group.canonical,
+			"error": firstErr,
+		}).Error("Failed to drain mint")
+		failures = append(failures, MintDrainFailure{
+			MintURL: group.canonical,
+			Error:   errText,
+		})
 	}
 
-	if len(tokens) == 0 {
+	if tokens == nil {
+		tokens = []CashuToken{}
+	}
+
+	result := WalletDrainResult{
+		Success:       len(failures) == 0,
+		Tokens:        tokens,
+		Total:         totalDrained,
+		Failures:      failures,
+		MergedEntries: mergedEntries,
+	}
+	if filename, ok := flags["save_to_file"]; ok && filename != "" {
+		result.SaveToFile = filename
+	}
+
+	if len(failures) > 0 {
 		return CLIResponse{
-			Success: true,
-			Message: "No tokens to drain - all mint balances are zero",
-			Data: WalletDrainResult{
-				Success: true,
-				Tokens:  []CashuToken{},
-				Total:   0,
-			},
+			Success:   false,
+			Message:   drainPartialMessage(totalDrained, len(tokens), len(failures)),
+			Error:     drainFailureSummary(failures, totalDrained, len(tokens)),
+			Data:      result,
 			Timestamp: time.Now(),
 		}
 	}
 
-	result := WalletDrainResult{
-		Success: true,
-		Tokens:  tokens,
-		Total:   totalDrained,
-	}
-
-	// Include filename in result if requested - client will handle saving
-	if filename, ok := flags["save_to_file"]; ok && filename != "" {
+	if len(tokens) == 0 {
+		// Nothing was drained. The requested save_to_file is still echoed back
+		// exactly as on the other paths, so a caller's flags are never dropped.
 		return CLIResponse{
-			Success: true,
-			Message: fmt.Sprintf("Successfully drained %d sats from %d mints", totalDrained, len(tokens)),
-			Data: map[string]interface{}{
-				"tokens":       tokens,
-				"total_sats":   totalDrained,
-				"save_to_file": filename,
-			},
+			Success:   true,
+			Message:   "No tokens to drain - all mint balances are zero",
+			Data:      result,
 			Timestamp: time.Now(),
 		}
 	}
@@ -357,6 +437,81 @@ func (s *CLIServer) handleCashuDrain(flags map[string]string) CLIResponse {
 		Data:      result,
 		Timestamp: time.Now(),
 	}
+}
+
+// drainPartialMessage describes a drain where some mints were drained and
+// others were not.
+func drainPartialMessage(totalDrained uint64, drainedMints, failedMints int) string {
+	if drainedMints == 0 {
+		return fmt.Sprintf("No tokens were drained; %d mint(s) failed", failedMints)
+	}
+	return fmt.Sprintf("Partially drained %d sats from %d mints; %d mint(s) failed", totalDrained, drainedMints, failedMints)
+}
+
+// drainFailureSummary is the aggregate error text. It spells out that any
+// tokens already produced are part of the response, because those tokens are
+// real funds: a caller that only reads the error string must not conclude that
+// nothing was drained (#375).
+func drainFailureSummary(failures []MintDrainFailure, totalDrained uint64, drainedMints int) string {
+	parts := make([]string, 0, len(failures))
+	for _, f := range failures {
+		parts = append(parts, fmt.Sprintf("%s: %s", f.MintURL, f.Error))
+	}
+
+	summary := fmt.Sprintf("failed to drain %d mint(s): %s", len(failures), strings.Join(parts, "; "))
+	if drainedMints > 0 {
+		summary += fmt.Sprintf(" - %d sats from %d mint(s) WERE drained; those tokens are included in this response and must be stored before retrying", totalDrained, drainedMints)
+	}
+	return summary
+}
+
+// drainGroup collects every wallet registry entry that describes the same mint
+type drainGroup struct {
+	canonical string
+	entries   []string
+}
+
+// canonicalMintURL is the identity of a mint for drain purposes: scheme and
+// host case-folded, trailing slash ignored. A mint whose configured URL was
+// corrected from ".../Bitcoin/" to ".../Bitcoin" is one mint, not two. This
+// mirrors the trailing-slash tolerant matching the wallet already applies to
+// accepted mints (tollwallet.MintURLMatches).
+func canonicalMintURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return strings.ToLower(strings.TrimRight(raw, "/"))
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host) + strings.TrimRight(u.Path, "/")
+}
+
+// groupMintEntries groups the wallet's per-mint registry entries by mint
+// identity and orders the result deterministically, so one drain run always
+// reports the same way.
+func groupMintEntries(balances map[string]uint64) []drainGroup {
+	entriesByMint := make(map[string][]string, len(balances))
+	for entry := range balances {
+		key := canonicalMintURL(entry)
+		entriesByMint[key] = append(entriesByMint[key], entry)
+	}
+
+	groups := make([]drainGroup, 0, len(entriesByMint))
+	for canonical, entries := range entriesByMint {
+		sort.Slice(entries, func(i, j int) bool {
+			// Prefer the entry without a redundant trailing slash: a corrected
+			// configuration uses that form. Both wrap the same mint, so this
+			// only decides which URL ends up in the report.
+			slashedI := strings.HasSuffix(entries[i], "/")
+			slashedJ := strings.HasSuffix(entries[j], "/")
+			if slashedI != slashedJ {
+				return !slashedI
+			}
+			return entries[i] < entries[j]
+		})
+		groups = append(groups, drainGroup{canonical: canonical, entries: entries})
+	}
+
+	sort.Slice(groups, func(i, j int) bool { return groups[i].canonical < groups[j].canonical })
+	return groups
 }
 
 // handleWalletBalance returns the current wallet balance

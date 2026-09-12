@@ -57,6 +57,14 @@ and [Semantic Versioning](https://semver.org/).
   on cross-platform WiFi research. Rebased from #332.
   ([#353](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/353))
 
+- **`tollgate wallet drain cashu --yes` for non-interactive drains.** The
+  drain command's confirmation prompt reads stdin, so invoking it over `ssh`
+  without a terminal cancelled the operation while still exiting `0`. The new
+  `-y`/`--yes` flag skips the prompt and keeps the plain-text output and the
+  token file; a cancelled drain now exits `2` and a failed (or partial) drain
+  exits `1`, so a caller can tell "nothing happened" from "drained".
+  ([#375](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/375))
+
 ### Changed
 
 - **Setup version bumped to v0.6.2.** Reinstall/upgrade now triggers a
@@ -85,6 +93,18 @@ and [Semantic Versioning](https://semver.org/).
   ([#368](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/368))
 
 ### Fixed
+
+- **`wallet drain cashu` no longer loses drained tokens when a mint
+  fails.** The drain handler returned early on the first per-mint error and
+  discarded every token a completed swap had already produced — reported on
+  hardware as a wallet dropping from 50 sats to 0 with the token printed and
+  persisted nowhere (issue #375). Drained tokens are now always part of the
+  response and written to the requested file, the mints that failed are
+  listed in a `failures` field, and registry entries that describe the same
+  mint (for example a stale trailing-slash URL left behind by a config fix)
+  are drained once and reported as `merged_entries` instead of being drained
+  a second time and failing the whole command.
+  ([#375](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/375))
 
 - **Payment-goroutine panics no longer kill the process.** A panic
   inside the wallet layer during `PurchaseSession`'s `Receive` call

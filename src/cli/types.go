@@ -34,11 +34,28 @@ type CashuToken struct {
 	Token   string `json:"token"`
 }
 
+// MintDrainFailure records a mint whose registered entries could not be drained
+type MintDrainFailure struct {
+	MintURL string `json:"mint_url"`
+	Error   string `json:"error"`
+}
+
 // WalletDrainResult represents the result of draining a wallet
 type WalletDrainResult struct {
 	Success bool         `json:"success"`
 	Tokens  []CashuToken `json:"tokens"`
 	Total   uint64       `json:"total_sats"`
+	// Failures lists the mints that could not be drained. Tokens still carries
+	// everything that WAS drained, so a partial drain never hides the tokens a
+	// completed swap already produced (#375).
+	Failures []MintDrainFailure `json:"failures,omitempty"`
+	// MergedEntries lists registry entries that describe the same mint as
+	// another entry (for example a stale trailing-slash duplicate) and were
+	// therefore drained once instead of twice.
+	MergedEntries []string `json:"merged_entries,omitempty"`
+	// SaveToFile, when requested by the caller, is the file the client writes
+	// the tokens to.
+	SaveToFile string `json:"save_to_file,omitempty"`
 }
 
 // ServiceStatus represents basic service status

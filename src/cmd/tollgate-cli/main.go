@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -24,9 +25,9 @@ func askConfirmation(message string) bool {
 	return response == "y" || response == "yes"
 }
 
-const (
-	SocketPath = "/var/run/tollgate.sock"
-)
+// SocketPath is the unix socket the CLI talks to. It is a variable so tests can
+// point the client at a stub service instead of the one on the router.
+var SocketPath = "/var/run/tollgate.sock"
 
 type CLIMessage struct {
 	Command   string            `json:"command"`
@@ -45,6 +46,32 @@ type CLIResponse struct {
 }
 
 var jsonOutput bool
+var drainCashuYes bool
+
+// Exit statuses of the CLI. A destructive command that did not run must never
+// look like a successful one to an orchestrator, cron job or CI step.
+const (
+	exitCodeFailure   = 1
+	exitCodeCancelled = 2
+)
+
+// errDrainCancelled is returned when the caller declined the confirmation
+// prompt. It maps to exitCodeCancelled instead of a plain failure so that
+// "nothing was drained because it was cancelled" is distinguishable from
+// "the drain was attempted and failed".
+var errDrainCancelled = errors.New("wallet drain cancelled")
+
+// exitCodeFor maps a command error to the process exit status.
+func exitCodeFor(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, errDrainCancelled):
+		return exitCodeCancelled
+	default:
+		return exitCodeFailure
+	}
+}
 
 var rootCmd = &cobra.Command{
 	Use:   "tollgate",
@@ -80,19 +107,35 @@ var drainCmd = &cobra.Command{
 var drainCashuCmd = &cobra.Command{
 	Use:   "cashu",
 	Short: "Drain wallet to Cashu tokens",
-	Long:  "Create Cashu tokens for each mint containing all available balance",
+	Long: `Create Cashu tokens for each mint containing all available balance.
+
+Every mint the wallet knows about is drained once. A mint whose registered URL
+differs only by a trailing slash is the same mint and is NOT drained twice, and
+a failure on one mint never discards the tokens another mint already produced:
+those tokens are printed (and saved with --save-to-file) before the error.
+
+Non-interactive use: pass --yes to skip the confirmation prompt. Without it the
+prompt is read from stdin, so running this over ssh without a terminal cancels
+the drain.
+
+Exit status: 0 = drained (or nothing to drain), 1 = the drain was attempted and
+failed (including a partial drain), 2 = cancelled, no funds were moved.`,
+	SilenceUsage:  true,
+	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if jsonOutput {
-			return sendCommandRaw("wallet", []string{"drain", "cashu"}, nil)
+			return sendCommandRawExpectSuccess("wallet", []string{"drain", "cashu"}, nil)
 		}
 
 		fmt.Println("\n⚠️  WARNING: Draining the wallet will remove ALL funds from the wallet!")
 		fmt.Println("The funds will be converted to Cashu tokens that will be saved to a file.")
 		fmt.Println("Once drained, the tokens are OUT of the wallet and must be stored securely.")
 
-		if !askConfirmation("\nAre you sure you want to drain the wallet?") {
-			fmt.Println("Operation cancelled.")
-			return nil
+		if !drainCashuYes {
+			if !askConfirmation("\nAre you sure you want to drain the wallet?") {
+				fmt.Println("Operation cancelled.")
+				return errDrainCancelled
+			}
 		}
 
 		filename := fmt.Sprintf("wallet_drain_%s.txt", time.Now().Format("2006-01-02_15-04-05"))
@@ -102,7 +145,7 @@ var drainCashuCmd = &cobra.Command{
 		}
 
 		fmt.Printf("\nTokens will be saved to: %s\n\n", filename)
-		return sendCommandAndDisplay("wallet", []string{"drain", "cashu"}, flags)
+		return sendDrainCashu(flags)
 	},
 }
 
@@ -454,6 +497,8 @@ func init() {
 	logsCmd.Flags().IntP("tail", "n", 0, "Number of lines to show from the end (0 = all)")
 	logsCmd.Flags().BoolP("follow", "f", false, "Follow log output (like tail -f)")
 
+	drainCashuCmd.Flags().BoolVarP(&drainCashuYes, "yes", "y", false, "Skip the confirmation prompt (non-interactive use)")
+
 	drainCmd.AddCommand(drainCashuCmd)
 	walletCmd.AddCommand(drainCmd, balanceCmd, infoCmd, fundCmd)
 	privateCmd.AddCommand(privateStatusCmd, privateEnableCmd, privateDisableCmd, privateRenameCmd, privateSetPasswordCmd)
@@ -465,10 +510,105 @@ func init() {
 }
 
 func main() {
-	if err := rootCmd.Execute(); err != nil {
+	err := rootCmd.Execute()
+	if err != nil && !errors.Is(err, errDrainCancelled) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
 	}
+	os.Exit(exitCodeFor(err))
+}
+
+// sendDrainCashu sends `wallet drain cashu` and renders the result.
+//
+// Unlike sendCommandAndDisplay it renders the tokens even when the aggregate
+// drain failed, because those tokens are funds: a partial drain must never hide
+// them (#375). The process still exits non-zero in that case.
+func sendDrainCashu(flags map[string]string) error {
+	msg := CLIMessage{
+		Command:   "wallet",
+		Args:      []string{"drain", "cashu"},
+		Flags:     flags,
+		Timestamp: time.Now(),
+	}
+
+	response, err := sendCommand(msg)
+	if err != nil {
+		return fmt.Errorf("failed to communicate with TollGate service: %v\nMake sure the TollGate service is running", err)
+	}
+
+	renderDrainResponse(response)
+
+	if !response.Success {
+		if response.Error != "" {
+			return errors.New(response.Error)
+		}
+		return errors.New("wallet drain did not complete")
+	}
+	return nil
+}
+
+// renderDrainResponse prints whatever the service reported. Tokens are printed
+// and written to the requested file before any error is reported, so a partial
+// drain never costs the caller the funds that WERE produced. The error itself is
+// reported once by main (it becomes the process exit status).
+func renderDrainResponse(response *CLIResponse) {
+	if response.Message != "" {
+		fmt.Println(response.Message)
+	}
+
+	rendered := false
+	if data, ok := response.Data.(map[string]interface{}); ok {
+		if _, hasTokens := data["tokens"]; hasTokens {
+			displayWalletDrainResult(data)
+			rendered = true
+		}
+	}
+
+	// A "successful" drain whose response carries no token payload at all would
+	// leave the operator with an empty wallet and nothing to spend. Say so
+	// loudly instead of exiting 0 in silence.
+	if response.Success && !rendered {
+		fmt.Fprintln(os.Stderr, "WARNING: the service reported a successful drain but returned no token payload; check `tollgate wallet balance` before retrying")
+	}
+}
+
+// sendCommandRawExpectSuccess behaves like sendCommandRaw, but reports a
+// non-zero exit status when the service answered with success=false. Automation
+// that reads JSON must still be able to tell that nothing happened (#375).
+//
+// Deliberately scoped to `wallet drain cashu`: that is the destructive command
+// whose silent exit-0 was reported in #375, and it is the only caller. The other
+// subcommands keep sendCommandRaw's historical behaviour (exit 0 on a
+// success=false payload) until each one is audited on its own, because changing
+// them changes the contract of commands this fix does not touch.
+func sendCommandRawExpectSuccess(command string, args []string, flags map[string]string) error {
+	msg := CLIMessage{
+		Command:   command,
+		Args:      args,
+		Flags:     flags,
+		Timestamp: time.Now(),
+	}
+
+	response, err := sendCommand(msg)
+	if err != nil {
+		printJSON(&CLIResponse{
+			Success:   false,
+			Error:     fmt.Sprintf("Failed to communicate with TollGate service: %v", err),
+			Timestamp: time.Now(),
+		})
+		return fmt.Errorf("failed to communicate with TollGate service: %v", err)
+	}
+
+	if err := printJSON(response); err != nil {
+		return err
+	}
+
+	if !response.Success {
+		if response.Error != "" {
+			return errors.New(response.Error)
+		}
+		return errors.New("command failed")
+	}
+	return nil
 }
 
 func sendCommandAndDisplay(command string, args []string, flags map[string]string) error {
@@ -850,34 +990,52 @@ func displayWalletDrainResult(data map[string]interface{}) {
 
 	if tokensData, ok := data["tokens"].([]interface{}); ok {
 		if len(tokensData) == 0 {
-			fmt.Println("No tokens created (all balances are zero)")
-			return
-		}
+			if _, hasFailures := data["failures"]; !hasFailures {
+				fmt.Println("No tokens created (all balances are zero)")
+			}
+		} else {
+			if filename != "" {
+				err := saveTokensToFile(filename, tokensData, data)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving tokens to file: %v\n", err)
+				} else {
+					fmt.Printf("✓ Tokens saved to: %s\n\n", filename)
+				}
+			}
 
-		if filename != "" {
-			err := saveTokensToFile(filename, tokensData, data)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error saving tokens to file: %v\n", err)
-			} else {
-				fmt.Printf("✓ Tokens saved to: %s\n\n", filename)
+			for i, tokenData := range tokensData {
+				if tokenMap, ok := tokenData.(map[string]interface{}); ok {
+					fmt.Printf("Token %d:\n", i+1)
+					if mintURL, ok := tokenMap["mint_url"].(string); ok {
+						fmt.Printf("  Mint: %s\n", mintURL)
+					}
+					if balance, ok := tokenMap["balance_sats"].(float64); ok {
+						fmt.Printf("  Balance: %.0f sats\n", balance)
+					}
+					if token, ok := tokenMap["token"].(string); ok {
+						fmt.Printf("  Token: %s\n", token)
+					}
+					fmt.Println()
+				}
 			}
 		}
+	}
 
-		for i, tokenData := range tokensData {
-			if tokenMap, ok := tokenData.(map[string]interface{}); ok {
-				fmt.Printf("Token %d:\n", i+1)
-				if mintURL, ok := tokenMap["mint_url"].(string); ok {
-					fmt.Printf("  Mint: %s\n", mintURL)
-				}
-				if balance, ok := tokenMap["balance_sats"].(float64); ok {
-					fmt.Printf("  Balance: %.0f sats\n", balance)
-				}
-				if token, ok := tokenMap["token"].(string); ok {
-					fmt.Printf("  Token: %s\n", token)
-				}
-				fmt.Println()
+	// A drain can succeed for one mint and fail for another. The tokens above
+	// are real funds that were already moved, so they are printed (and saved)
+	// before this report, never instead of it.
+	if failures, ok := data["failures"].([]interface{}); ok && len(failures) > 0 {
+		fmt.Println("Mints that could NOT be drained:")
+		for _, failureData := range failures {
+			failureMap, ok := failureData.(map[string]interface{})
+			if !ok {
+				continue
 			}
+			mintURL, _ := failureMap["mint_url"].(string)
+			failureText, _ := failureMap["error"].(string)
+			fmt.Printf("  %s: %s\n", mintURL, failureText)
 		}
+		fmt.Println()
 	}
 }
 
