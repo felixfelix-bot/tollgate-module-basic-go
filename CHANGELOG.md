@@ -320,6 +320,8 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Changed / Internal
 
+- **Nostr CI runs the documented pre-PR gate.** `.ngit/act/workflows/go-test.yml` runs `gofmt -l .`, `go vet ./...`, `go build ./...` and the race-enabled `testenv` suite from `src/` under ngit-ci, alongside the existing port of the GitHub test pipeline. GitHub Actions is unchanged.
+
 - **Spec-quote drift checking in CI.** greatspectations quotes are now
   verified against current cashubtc/nuts HEAD on every push (new step
   in the contract-lint job; drift fails the build). Fixed one drifted
