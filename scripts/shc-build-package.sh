@@ -3,9 +3,12 @@
 #
 # Orders a short-lived SHC (Sovereign Hybrid Compute) VM, syncs the working
 # tree (including uncommitted changes) to it, builds the aarch64 .ipk via
-# packaging/local-build-ipk.sh, proves --version on the built binaries
-# (natively for amd64, under qemu for the arm64 binaries extracted from the
-# .ipk), copies the artifact back, and cancels the VM.
+# packaging/local-build-ipk.sh, proves the package control metadata and the
+# --version output of the built binaries (the arm64 binaries extracted from
+# the .ipk, executed under qemu-aarch64-static), copies the artifact back,
+# and cancels the VM. The --version proof is mandatory: if qemu-user-static
+# cannot be installed the script fails rather than reporting a build whose
+# --version output it never saw.
 #
 # Requires: SHC_API_KEY in env, shc CLI on PATH (github.com/Amperstrand/shc-toolkit),
 # ssh, and a public key at SSH_PUB (default ~/.ssh/id_ed25519.pub).
@@ -26,9 +29,11 @@
 #   SHC_TEMPLATE  OS template       (default: debian13)
 #   SHC_REAP      reaper deadline   (default: 2h — backstop if this script dies)
 #   SSH_PUB       public key path   (default: ~/.ssh/id_ed25519.pub)
-#   GO_VERSION    Go toolchain      (default: 1.25.8 — must satisfy src/go.mod)
 #   PKG_VERSION   embedded version  (default: VERSION at the repository root)
 #   OUT_DIR       artifact dir      (default: artifacts/shc)
+#
+# The Go toolchain — version, tarball URL and tarball sha256 — is read from
+# packaging/build-inputs.json; this script keeps no toolchain literal.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,13 +43,25 @@ SHC_SIZE="${SHC_SIZE:-nvme-2c-8gb}"
 SHC_TEMPLATE="${SHC_TEMPLATE:-debian13}"
 SHC_REAP="${SHC_REAP:-2h}"
 SSH_PUB="${SSH_PUB:-$HOME/.ssh/id_ed25519.pub}"
-GO_VERSION="${GO_VERSION:-1.25.8}"
 # The release version comes from the repository-root VERSION file, the single
 # source of truth (see CONTRIBUTING.md); set PKG_VERSION to override.
 PKG_VERSION="${PKG_VERSION:-$(cat "$REPO_ROOT/VERSION")}"
 OUT_DIR="${OUT_DIR:-artifacts/shc}"
 
 die() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
+
+# Pinned Go toolchain inputs, straight from the manifest.
+TG_BUILD_INPUTS="$REPO_ROOT/packaging/build-inputs.json"
+[ -f "$TG_BUILD_INPUTS" ] || die "missing $TG_BUILD_INPUTS"
+command -v jq >/dev/null 2>&1 || die "jq is required to read $TG_BUILD_INPUTS"
+GO_VERSION="$(jq -r '.go.version' "$TG_BUILD_INPUTS")"
+GO_URL="$(jq -r '.go.tarball_linux_amd64.url' "$TG_BUILD_INPUTS")"
+GO_SHA256="$(jq -r '.go.tarball_linux_amd64.sha256' "$TG_BUILD_INPUTS")"
+for _v in "$GO_VERSION" "$GO_URL" "$GO_SHA256"; do
+  case "$_v" in
+    ''|null) die "go toolchain input missing from $TG_BUILD_INPUTS" ;;
+  esac
+done
 command -v shc >/dev/null 2>&1 || die "shc CLI not on PATH (pip install shc-toolkit)"
 [ -n "${SHC_API_KEY:-}" ] || die "SHC_API_KEY not set"
 [ -f "$SSH_PUB" ] || die "public key not found: $SSH_PUB"
@@ -95,7 +112,10 @@ echo "=== [3/5] remote build (local-build-ipk.sh, verbatim) ==="
   chmod +x /tmp/shim/git
   sudo apt-get update -qq >/dev/null 2>&1 || true
   sudo apt-get install -y -qq jq >/dev/null 2>&1
-  curl -sSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.tgz
+  # Go toolchain: URL and sha256 come from packaging/build-inputs.json (passed
+  # in by the caller); the tarball is verified before it is unpacked.
+  curl -fsSL '$GO_URL' -o /tmp/go.tgz
+  printf '%s  %s\n' '$GO_SHA256' /tmp/go.tgz | sha256sum -c - >&2
   sudo tar -C /usr/local -xzf /tmp/go.tgz
   export PATH=/usr/local/go/bin:/tmp/shim:\$PATH
   export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
@@ -107,18 +127,21 @@ echo "=== [4/5] proving --version on built binaries ==="
 "${SSH_CMD[@]}" "set -e
   IPK=/tmp/tree/packaging/tollgate-wrt_${PKG_VERSION}_aarch64_cortex-a53.ipk
   [ -f \"\$IPK\" ] || { echo 'ipk missing' >&2; exit 1; }
-  sudo apt-get update -qq >/dev/null 2>&1 || true
-  sudo apt-get install -y -qq qemu-user-static binutils >/dev/null 2>&1 || true
+  sudo apt-get update -qq >/dev/null 2>&1 || echo 'WARNING: apt-get update failed' >&2
+  sudo apt-get install -y -qq qemu-user-static binutils >/dev/null 2>&1 \
+    || echo 'WARNING: apt-get install qemu-user-static binutils failed' >&2
   rm -rf /tmp/ipkx && mkdir -p /tmp/ipkx && cd /tmp/ipkx
   tar xzf \"\$IPK\"
   tar xzf ./control.tar.gz; tar xzf ./data.tar.gz
   echo '--- control:'; grep -E '^(Package|Version|Architecture|License):' ./control
-  if command -v qemu-aarch64-static >/dev/null 2>&1; then
-    qemu-aarch64-static usr/bin/tollgate --version
-    qemu-aarch64-static usr/bin/tollgate-wrt --version
-  else
-    echo 'NOTE: qemu-user-static unavailable; skipping arm64 execution proof'
-  fi
+  # The --version proof is mandatory (see the header): a silent skip would
+  # report a build as verified that nobody ever executed, so fail closed.
+  command -v qemu-aarch64-static >/dev/null 2>&1 || {
+    echo 'ERROR: qemu-aarch64-static unavailable - cannot execute the arm64 --version proof' >&2
+    echo 'ERROR: refusing to report success for a build whose --version output was never seen' >&2
+    exit 1; }
+  qemu-aarch64-static usr/bin/tollgate --version
+  qemu-aarch64-static usr/bin/tollgate-wrt --version
   sha256sum \"\$IPK\" /tmp/tree/bin/arm64/tollgate-wrt /tmp/tree/bin/arm64/tollgate"
 
 echo "=== [5/5] fetching artifact ==="
