@@ -454,8 +454,8 @@ func TestExitCodeFor(t *testing.T) {
 	if code := exitCodeFor(nil); code != 0 {
 		t.Errorf("exitCodeFor(nil) = %d, want 0", code)
 	}
-	if code := exitCodeFor(errDrainCancelled); code != exitCodeCancelled {
-		t.Errorf("exitCodeFor(errDrainCancelled) = %d, want %d: the documented contract is 2 = cancelled, no funds moved", code, exitCodeCancelled)
+	if code := exitCodeFor(errCancelled); code != exitCodeCancelled {
+		t.Errorf("exitCodeFor(errCancelled) = %d, want %d: the documented contract is 2 = cancelled, nothing happened", code, exitCodeCancelled)
 	}
 	if code := exitCodeFor(errors.New("boom")); code != exitCodeFailure {
 		t.Errorf("exitCodeFor(generic error) = %d, want %d: the documented contract is 1 = attempted and failed", code, exitCodeFailure)

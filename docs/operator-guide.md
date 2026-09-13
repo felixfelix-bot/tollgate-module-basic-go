@@ -318,6 +318,13 @@ network or physical access).
 Are you sure you want to disable the private network? (y/N):
 ```
 
+Declining that prompt (or having no terminal to answer it with, the way
+`ssh router 'tollgate network private disable'` runs) prints
+`Operation cancelled.` and exits `2`: nothing was disabled, and a
+script must not read that as success. With `--json` the prompt is
+skipped entirely, and a `success:false` payload exits `1` like every
+other state-changing command.
+
 ### Rename the SSID
 
 ```sh
@@ -517,11 +524,51 @@ tollgate --json wallet drain cashu
 tollgate --json health
 ```
 
-When the service is unreachable, `--json` output still includes a
-`success: false` object with an `error` field rather than printing
-prose to stderr, so a wrapper script can parse the failure reliably —
-and the process now also exits non-zero, so a script that only checks
-the exit status is not misled either.
+The JSON object always goes to **stdout**. What the CLI itself has to
+say about a failure (`Error: …` and the command's usage line) goes to
+stderr, so `tollgate --json … | jq …` stays parseable either way.
+
+### Exit status with --json
+
+There are two rules, by command class:
+
+| Command class | `success:false` payload | service unreachable |
+| --- | --- | --- |
+| state-changing | exit `1` | exit `1` |
+| read-only | exit `0` (the failure is in the JSON) | exit `1` |
+
+**State-changing commands** — `wallet fund`, `wallet drain cashu`,
+`network private enable` / `disable` / `rename` / `set-password`,
+`upstream remove`, `config set` / `save` / `save-identities`, and
+`start` / `stop` / `restart`. A `success:false` payload exits `1`: a
+caller that checks only the exit status must never mistake "nothing
+changed" for "the change was applied". The JSON payload is whatever the
+service sent, unchanged.
+
+**Read-only commands** — `wallet balance`, `wallet info`, `status`,
+`network private status`, `version`, `upstream scan` / `list` / `known`,
+`config get`, `config schema`, and `health`. A `success:false` payload
+keeps exit `0`, so `tollgate --json status | jq .success` pipelines keep
+working; read `.success` and `.error` instead of the exit status.
+
+**Unreachable service** — every command, read-only included, exits
+non-zero, because then not even a failed answer was produced. The JSON
+still carries a `success: false` object with an `error` field rather
+than prose on stderr, so a wrapper script can parse the failure and a
+script that only checks the exit status is not misled either.
+
+In plain (non `--json`) mode the rules are the same except that a
+read-only failure also exits `1`, because there is no JSON payload to
+carry the error.
+
+### Commands without a --json form
+
+`ssl apply`, `ssl remove` and `ssl status` do not implement `--json`;
+they print human-readable text only, and `upstream connect` streams
+progress lines and also ignores `--json`. They exit non-zero when they
+fail. Their confirmation prompts are the exception: declining one still
+prints `Aborted.` and exits `0`. That gap is tracked separately and is
+not part of this exit-status audit.
 
 For `wallet drain cashu` specifically: a `success: false` response
 (including a partial drain) exits `1`, and any tokens that *were*

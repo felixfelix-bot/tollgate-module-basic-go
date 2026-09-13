@@ -48,6 +48,14 @@ type CLIResponse struct {
 var jsonOutput bool
 var drainCashuYes bool
 
+// serviceCommand builds the init-script invocations the start/stop/restart
+// commands run. It is a variable so tests can exercise both the success and the
+// failure exit status without starting, stopping or requiring the router's real
+// services.
+var serviceCommand = func(name string, args ...string) *exec.Cmd {
+	return exec.Command(name, args...)
+}
+
 // Exit statuses of the CLI. A destructive command that did not run must never
 // look like a successful one to an orchestrator, cron job or CI step.
 const (
@@ -55,18 +63,18 @@ const (
 	exitCodeCancelled = 2
 )
 
-// errDrainCancelled is returned when the caller declined the confirmation
-// prompt. It maps to exitCodeCancelled instead of a plain failure so that
-// "nothing was drained because it was cancelled" is distinguishable from
-// "the drain was attempted and failed".
-var errDrainCancelled = errors.New("wallet drain cancelled")
+// errCancelled is returned when the caller declined the confirmation prompt of
+// a destructive command. It maps to exitCodeCancelled instead of a plain
+// failure so that "nothing happened because it was cancelled" is
+// distinguishable from "the action was attempted and failed".
+var errCancelled = errors.New("command cancelled")
 
 // exitCodeFor maps a command error to the process exit status.
 func exitCodeFor(err error) int {
 	switch {
 	case err == nil:
 		return 0
-	case errors.Is(err, errDrainCancelled):
+	case errors.Is(err, errCancelled):
 		return exitCodeCancelled
 	default:
 		return exitCodeFailure
@@ -134,7 +142,7 @@ failed (including a partial drain), 2 = cancelled, no funds were moved.`,
 		if !drainCashuYes {
 			if !askConfirmation("\nAre you sure you want to drain the wallet?") {
 				fmt.Println("Operation cancelled.")
-				return errDrainCancelled
+				return errCancelled
 			}
 		}
 
@@ -191,7 +199,7 @@ var fundCmd = &cobra.Command{
 			return fmt.Errorf("no token provided")
 		}
 
-		return sendCommandAndDisplay("wallet", []string{"fund", cashuToken}, nil)
+		return sendCommandStateChanging("wallet", []string{"fund", cashuToken}, nil)
 	},
 }
 
@@ -218,7 +226,7 @@ var privateEnableCmd = &cobra.Command{
 	Short: "Enable private network",
 	Long:  "Enable the private WiFi network on both 2.4GHz and 5GHz radios",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return sendCommandAndDisplay("network", []string{"private", "enable"}, nil)
+		return sendCommandStateChanging("network", []string{"private", "enable"}, nil)
 	},
 }
 
@@ -228,7 +236,7 @@ var privateDisableCmd = &cobra.Command{
 	Long:  "Disable the private WiFi network on both 2.4GHz and 5GHz radios",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if jsonOutput {
-			return sendCommandRaw("network", []string{"private", "disable"}, nil)
+			return sendCommandStateChanging("network", []string{"private", "disable"}, nil)
 		}
 
 		fmt.Println("\n⚠️  WARNING: Disabling the private network may lock you out of the router!")
@@ -236,7 +244,7 @@ var privateDisableCmd = &cobra.Command{
 
 		if !askConfirmation("\nAre you sure you want to disable the private network?") {
 			fmt.Println("Operation cancelled.")
-			return nil
+			return errCancelled
 		}
 
 		return sendCommandAndDisplay("network", []string{"private", "disable"}, nil)
@@ -249,7 +257,7 @@ var privateRenameCmd = &cobra.Command{
 	Long:  "Change the SSID of the private WiFi network",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return sendCommandAndDisplay("network", []string{"private", "rename", args[0]}, nil)
+		return sendCommandStateChanging("network", []string{"private", "rename", args[0]}, nil)
 	},
 }
 
@@ -260,9 +268,9 @@ var privateSetPasswordCmd = &cobra.Command{
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
-			return sendCommandAndDisplay("network", []string{"private", "set-password"}, nil)
+			return sendCommandStateChanging("network", []string{"private", "set-password"}, nil)
 		}
-		return sendCommandAndDisplay("network", []string{"private", "set-password", args[0]}, nil)
+		return sendCommandStateChanging("network", []string{"private", "set-password", args[0]}, nil)
 	},
 }
 
@@ -346,7 +354,7 @@ var upstreamRemoveCmd = &cobra.Command{
 	Long:  "Remove a disabled upstream STA interface from the wireless configuration. Active upstreams cannot be removed.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return sendCommandAndDisplay("upstream", []string{"remove-upstream", args[0]}, nil)
+		return sendCommandStateChanging("upstream", []string{"remove-upstream", args[0]}, nil)
 	},
 }
 
@@ -396,7 +404,7 @@ Examples:
   tollgate config set show_setup false`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return sendCommandAndDisplay("config", []string{"set", args[0], args[1]}, nil)
+		return sendCommandStateChanging("config", []string{"set", args[0], args[1]}, nil)
 	},
 }
 
@@ -415,7 +423,7 @@ var configSaveCmd = &cobra.Command{
 	Long:  "Replace the entire config.json with the provided JSON string. Use with caution.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return sendCommandAndDisplay("config", []string{"save", args[0]}, nil)
+		return sendCommandStateChanging("config", []string{"save", args[0]}, nil)
 	},
 }
 
@@ -425,7 +433,7 @@ var configSaveIdentitiesCmd = &cobra.Command{
 	Long:  "Replace the entire identities.json with the provided JSON string. Use with caution.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return sendCommandAndDisplay("config", []string{"save-identities", args[0]}, nil)
+		return sendCommandStateChanging("config", []string{"save-identities", args[0]}, nil)
 	},
 }
 
@@ -441,13 +449,20 @@ var healthCmd = &cobra.Command{
 		})
 		if err != nil {
 			if jsonOutput {
-				return printJSON(map[string]interface{}{
+				printErr := printJSON(map[string]interface{}{
 					"success":   false,
 					"running":   false,
 					"socket_ok": false,
 					"error":     fmt.Sprintf("Service not reachable: %v", err),
 					"timestamp": time.Now().Format(time.RFC3339),
 				})
+				if printErr != nil {
+					return printErr
+				}
+				// Same contract as sendCommandAndDisplay: the JSON documents the
+				// failure and `health` is the command monitoring loops use, so
+				// the exit status has to report the unreachable service too.
+				return fmt.Errorf("Service not reachable: %v", err)
 			}
 			return fmt.Errorf("Service not reachable: %v", err)
 		}
@@ -511,7 +526,7 @@ func init() {
 
 func main() {
 	err := rootCmd.Execute()
-	if err != nil && !errors.Is(err, errDrainCancelled) {
+	if err != nil && !errors.Is(err, errCancelled) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
 	os.Exit(exitCodeFor(err))
@@ -571,15 +586,16 @@ func renderDrainResponse(response *CLIResponse) {
 	}
 }
 
-// sendCommandRawExpectSuccess behaves like sendCommandRaw, but reports a
-// non-zero exit status when the service answered with success=false. Automation
-// that reads JSON must still be able to tell that nothing happened (#375).
+// sendCommandRawExpectSuccess sends a command and prints the service's response
+// as JSON, but reports a non-zero exit status when that response is
+// success=false. Automation that reads JSON must still be able to tell that
+// nothing happened (#375).
 //
-// Deliberately scoped to `wallet drain cashu`: that is the destructive command
-// whose silent exit-0 was reported in #375, and it is the only caller. The other
-// subcommands keep sendCommandRaw's historical behaviour (exit 0 on a
-// success=false payload) until each one is audited on its own, because changing
-// them changes the contract of commands this fix does not touch.
+// The JSON output shape is exactly what the service sent — this helper only
+// changes the exit status. It is the --json path of every state-changing
+// command; those call sites name their intent by going through
+// sendCommandStateChanging. It was introduced for `wallet drain cashu` in #375
+// and generalised here after auditing every other subcommand.
 func sendCommandRawExpectSuccess(command string, args []string, flags map[string]string) error {
 	msg := CLIMessage{
 		Command:   command,
@@ -611,6 +627,33 @@ func sendCommandRawExpectSuccess(command string, args []string, flags map[string
 	return nil
 }
 
+// sendCommandStateChanging runs a command that changes router state (enabling or
+// disabling an interface, funding the wallet, writing configuration).
+//
+// Under --json it goes through sendCommandRawExpectSuccess, so a success:false
+// payload exits non-zero: an orchestrator that checks only the exit status must
+// not mistake "nothing changed" for "the change was applied". Without --json,
+// sendCommandAndDisplay already reported success:false as a non-zero exit before
+// this audit.
+//
+// Read-only commands must NOT use this: their --json contract deliberately keeps
+// exit 0 for a success:false payload (the failure is in the JSON) and is pinned
+// by TestJSON_ReadOnlyCommand_FailurePayloadKeepsExitZero.
+func sendCommandStateChanging(command string, args []string, flags map[string]string) error {
+	if jsonOutput {
+		return sendCommandRawExpectSuccess(command, args, flags)
+	}
+	return sendCommandAndDisplay(command, args, flags)
+}
+
+// sendCommandAndDisplay sends a command and renders the service's answer: the
+// human-readable form normally, the service's own JSON object with --json.
+//
+// --json contract for the read-only commands that use it: a success:false
+// payload is reported inside that JSON and the exit status stays 0, so
+// `tollgate --json status | jq .success` pipelines keep working; an unreachable
+// service, however, exits non-zero, because then not even a failed answer was
+// produced.
 func sendCommandAndDisplay(command string, args []string, flags map[string]string) error {
 	msg := CLIMessage{
 		Command:   command,
@@ -622,11 +665,18 @@ func sendCommandAndDisplay(command string, args []string, flags map[string]strin
 	response, err := sendCommand(msg)
 	if err != nil {
 		if jsonOutput {
-			return printJSON(&CLIResponse{
+			printErr := printJSON(&CLIResponse{
 				Success:   false,
 				Error:     fmt.Sprintf("Failed to communicate with TollGate service: %v", err),
 				Timestamp: time.Now(),
 			})
+			if printErr != nil {
+				return printErr
+			}
+			// The JSON object above documents the failure for a parser; the exit
+			// status has to carry it too, or `tollgate --json status` in a
+			// monitoring loop keeps looking healthy while the service is down.
+			return fmt.Errorf("failed to communicate with TollGate service: %v", err)
 		}
 		return fmt.Errorf("failed to communicate with TollGate service: %v\nMake sure the TollGate service is running", err)
 	}
@@ -642,26 +692,6 @@ func sendCommandAndDisplay(command string, args []string, flags map[string]strin
 	}
 
 	return nil
-}
-
-func sendCommandRaw(command string, args []string, flags map[string]string) error {
-	msg := CLIMessage{
-		Command:   command,
-		Args:      args,
-		Flags:     flags,
-		Timestamp: time.Now(),
-	}
-
-	response, err := sendCommand(msg)
-	if err != nil {
-		return printJSON(&CLIResponse{
-			Success:   false,
-			Error:     fmt.Sprintf("Failed to communicate with TollGate service: %v", err),
-			Timestamp: time.Now(),
-		})
-	}
-
-	return printJSON(response)
 }
 
 func printJSON(v interface{}) error {
@@ -775,24 +805,24 @@ func executeServiceCommand(action string) error {
 			name string
 			cmd  *exec.Cmd
 		}{
-			{"NoDogSplash", exec.Command("/etc/init.d/nodogsplash", "start")},
-			{"TollGate", exec.Command("/etc/init.d/tollgate-wrt", "start")},
+			{"NoDogSplash", serviceCommand("/etc/init.d/nodogsplash", "start")},
+			{"TollGate", serviceCommand("/etc/init.d/tollgate-wrt", "start")},
 		}
 	case "stop":
 		cmds = []struct {
 			name string
 			cmd  *exec.Cmd
 		}{
-			{"TollGate", exec.Command("/etc/init.d/tollgate-wrt", "stop")},
-			{"NoDogSplash", exec.Command("/etc/init.d/nodogsplash", "stop")},
+			{"TollGate", serviceCommand("/etc/init.d/tollgate-wrt", "stop")},
+			{"NoDogSplash", serviceCommand("/etc/init.d/nodogsplash", "stop")},
 		}
 	case "restart":
 		cmds = []struct {
 			name string
 			cmd  *exec.Cmd
 		}{
-			{"NoDogSplash", exec.Command("/etc/init.d/nodogsplash", "restart")},
-			{"TollGate", exec.Command("/etc/init.d/tollgate-wrt", "restart")},
+			{"NoDogSplash", serviceCommand("/etc/init.d/nodogsplash", "restart")},
+			{"TollGate", serviceCommand("/etc/init.d/tollgate-wrt", "restart")},
 		}
 	default:
 		return fmt.Errorf("unknown service action: %s", action)
@@ -829,40 +859,50 @@ func executeServiceCommandJSON(action string) error {
 			name string
 			cmd  *exec.Cmd
 		}{
-			{"NoDogSplash", exec.Command("/etc/init.d/nodogsplash", "start")},
-			{"TollGate", exec.Command("/etc/init.d/tollgate-wrt", "start")},
+			{"NoDogSplash", serviceCommand("/etc/init.d/nodogsplash", "start")},
+			{"TollGate", serviceCommand("/etc/init.d/tollgate-wrt", "start")},
 		}
 	case "stop":
 		cmds = []struct {
 			name string
 			cmd  *exec.Cmd
 		}{
-			{"TollGate", exec.Command("/etc/init.d/tollgate-wrt", "stop")},
-			{"NoDogSplash", exec.Command("/etc/init.d/nodogsplash", "stop")},
+			{"TollGate", serviceCommand("/etc/init.d/tollgate-wrt", "stop")},
+			{"NoDogSplash", serviceCommand("/etc/init.d/nodogsplash", "stop")},
 		}
 	case "restart":
 		cmds = []struct {
 			name string
 			cmd  *exec.Cmd
 		}{
-			{"NoDogSplash", exec.Command("/etc/init.d/nodogsplash", "restart")},
-			{"TollGate", exec.Command("/etc/init.d/tollgate-wrt", "restart")},
+			{"NoDogSplash", serviceCommand("/etc/init.d/nodogsplash", "restart")},
+			{"TollGate", serviceCommand("/etc/init.d/tollgate-wrt", "restart")},
 		}
 	default:
-		return printJSON(map[string]interface{}{
+		if printErr := printJSON(map[string]interface{}{
 			"success": false,
 			"error":   fmt.Sprintf("unknown service action: %s", action),
-		})
+		}); printErr != nil {
+			return printErr
+		}
+		return fmt.Errorf("unknown service action: %s", action)
 	}
 
 	for _, c := range cmds {
 		output, err := c.cmd.CombinedOutput()
 		if err != nil {
-			return printJSON(map[string]interface{}{
+			if printErr := printJSON(map[string]interface{}{
 				"success": false,
 				"error":   fmt.Sprintf("failed to %s %s: %v", action, c.name, err),
 				"output":  string(output),
-			})
+			}); printErr != nil {
+				return printErr
+			}
+			// The JSON object above reports which init script failed; the exit
+			// status has to report it too, or a script that only checks the exit
+			// status believes the service was started/stopped/restarted when it
+			// was not.
+			return fmt.Errorf("failed to %s %s", action, c.name)
 		}
 	}
 

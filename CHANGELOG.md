@@ -106,6 +106,22 @@ and [Semantic Versioning](https://semver.org/).
   a second time and failing the whole command.
   ([#375](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/375))
 
+- **`--json` exit status audited for the remaining subcommands.** The #375 fix
+  made `wallet drain cashu --json` exit non-zero on a `success:false` payload,
+  but every other state-changing subcommand still printed the same JSON error
+  object and then exited `0`, so an orchestrator that reads only the exit
+  status could not tell that nothing had happened. `wallet fund`,
+  `network private enable`/`disable`/`rename`/`set-password`,
+  `upstream remove`, `config set`/`save`/`save-identities` and
+  `start`/`stop`/`restart` now exit `1` on `success:false`. Every command,
+  read-only ones included, now exits non-zero when the service is
+  unreachable, which the operator guide previously claimed for `drain` only.
+  Read-only commands keep exit `0` for a `success:false` payload, with the
+  failure reported in the JSON, and their plain-text behaviour is unchanged.
+  A cancelled `network private disable` now exits `2` instead of `0`. The
+  JSON payload itself is unchanged in every case.
+  ([#375](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/375))
+
 - **Payment-goroutine panics no longer kill the process.** A panic
   inside the wallet layer during `PurchaseSession`'s `Receive` call
   (e.g. a mint returning malformed keysets) crashed the whole
