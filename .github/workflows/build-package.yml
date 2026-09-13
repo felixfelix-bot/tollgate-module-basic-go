@@ -45,6 +45,14 @@ jobs:
       ipk_matrix: ${{ steps.set-matrix.outputs.ipk_matrix }}
       apk_matrix: ${{ steps.set-matrix.outputs.apk_matrix }}
     steps:
+      # packaging/build-inputs.json is the single source of truth for the
+      # SDK digests: the package-apk container image ref is digest-pinned,
+      # and a matrix row without one renders a dangling `image@` ref that
+      # docker rejects at container setup.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
       - id: set-matrix
         run: |
           : ${GITHUB_OUTPUT:=/tmp/github_output}
@@ -84,7 +92,28 @@ jobs:
             (.include[] | select(.apk) | del(.ipk, .apk) + {format: "apk"})
           ]}' matrix.json)" >> $GITHUB_OUTPUT
           echo "ipk_matrix=$(jq -c '{include: [.include[] | select(.ipk) | del(.ipk, .apk) + {format: "ipk"}]}' matrix.json)" >> $GITHUB_OUTPUT
-          echo "apk_matrix=$(jq -c '{include: [.include[] | select(.apk) | del(.ipk, .apk) + {format: "apk"}]}' matrix.json)" >> $GITHUB_OUTPUT
+
+          # Every apk row drives a digest-pinned container image ref, so a row
+          # without a `digest` renders `openwrt/sdk:<sdk>-25.12.0@` and the leg
+          # dies inside docker at container setup. Resolve the digest from
+          # packaging/build-inputs.json — the single source of truth — for any
+          # apk row that does not pin one, then fail closed if a target is
+          # still unpinned. matrix/ipk_matrix above are untouched.
+          jq -c --slurpfile inputs packaging/build-inputs.json '{include: [
+            .include[] | select(.apk) | del(.ipk, .apk) + {format: "apk"}
+            | if has("digest") then .
+              else . + {digest: ($inputs[0].openwrt_sdk.targets[.sdk].digest // "")}
+              end
+          ]}' matrix.json > apk_matrix.json
+
+          UNPINNED="$(jq -r '[.include[] | select((.digest // "") == "") | .sdk]
+            | join(", ")' apk_matrix.json)"
+          if [ -n "$UNPINNED" ]; then
+            echo "ERROR: no SDK digest pinned for apk target(s): $UNPINNED" >&2
+            echo "Add the digest to packaging/build-inputs.json (.openwrt_sdk.targets)." >&2
+            exit 1
+          fi
+          echo "apk_matrix=$(cat apk_matrix.json)" >> $GITHUB_OUTPUT
 
   determine-versioning:
     runs-on: ubuntu-latest
