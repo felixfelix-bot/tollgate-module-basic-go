@@ -609,8 +609,11 @@ jobs:
           set -euo pipefail
           # Pinned UPX (version + sha256 in packaging/build-inputs.json);
           # apt's upx-ucl floats and its output IS part of the artifact.
-          bash scripts/fetch-upx.sh
-          echo "$HOME/.cache/tollgate-tools/upx/$(jq -r '.upx.version' packaging/build-inputs.json)" >> "$GITHUB_PATH"
+          # This job checks the repository out into src-checkout/, so the
+          # script and the manifest it reads are addressed there and not at
+          # $GITHUB_WORKSPACE.
+          bash src-checkout/scripts/fetch-upx.sh
+          echo "$HOME/.cache/tollgate-tools/upx/$(jq -r '.upx.version' src-checkout/packaging/build-inputs.json)" >> "$GITHUB_PATH"
 
       - name: Download portal assets
         uses: actions/download-artifact@v4
