@@ -9,11 +9,16 @@
 #           mips_24kc | mipsel_24kc | aarch64_cortex-a72
 #
 # Env:
-#   SOURCE_DATE_EPOCH  optional override; default = HEAD commit timestamp
+#   SOURCE_DATE_EPOCH  optional override; default = HEAD commit timestamp.
+#                      A checkout with no readable git history falls back to
+#                      TG_REPRO_FALLBACK_EPOCH (below) and says so on stderr.
+#   TG_REPRO_FALLBACK_EPOCH  epoch used when neither the environment nor git
+#                      can supply one (default 0 = 1970-01-01T00:00:00Z)
 #   PKG_VERSION        default = VERSION at the repository root
 #   TG_GIT_COMMIT      optional override; default = `git rev-parse --short
 #                      HEAD` of this repository (never a placeholder, so the
-#                      stamped GitCommit matches the release lane's)
+#                      stamped GitCommit matches the release lane's); with no
+#                      readable git history it degrades to "unknown" and warns
 #   TG_TOOLS           dir with pinned go/node (subdirs go/ node/);
 #                      default ~/.cache/tollgate-tools
 #   KEEP=1             keep the two build roots for inspection
@@ -36,9 +41,27 @@ export TG_TOOLS
 
 # SOURCE_DATE_EPOCH is exported BEFORE sourcing build-env so both roots get
 # the identical epoch even though neither copy carries git history.
+#
+# Precedence, and why it is spelled out: an environment-supplied value wins
+# (a CI job container can have a workspace with no .git at all and passes both
+# values explicitly), then the enclosing repository's HEAD commit. When neither
+# is available the harness degrades to the fixed fallback epoch and says so
+# loudly instead of dying inside git ("fatal: not a git repository" reads like
+# a harness bug, not like a missing input). The two clean roots are still
+# compared — that is what this script exists to do — but the bytes produced are
+# not the bytes of a release build, whose epoch is the commit time.
 if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
-    SOURCE_DATE_EPOCH="$(git -C "$REPO_ROOT" log -1 --format=%ct HEAD)"
-    export SOURCE_DATE_EPOCH
+    if SOURCE_DATE_EPOCH="$(git -C "$REPO_ROOT" log -1 --format=%ct HEAD 2>/dev/null)" \
+        && [ -n "$SOURCE_DATE_EPOCH" ]; then
+        export SOURCE_DATE_EPOCH
+    else
+        SOURCE_DATE_EPOCH="${TG_REPRO_FALLBACK_EPOCH:-0}"
+        export SOURCE_DATE_EPOCH
+        echo "warning: no readable git history under $REPO_ROOT and SOURCE_DATE_EPOCH is unset" >&2
+        echo "warning: using the fixed fallback epoch $SOURCE_DATE_EPOCH ($(date -u -d "@$SOURCE_DATE_EPOCH" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo 'unix epoch'))" >&2
+        echo "warning: both roots still build the same bytes, but they are not" >&2
+        echo "warning: byte-comparable with a release build of this commit." >&2
+    fi
 fi
 TG_ROOT="$REPO_ROOT"
 export TG_ROOT
@@ -53,6 +76,15 @@ export TG_ROOT
 # the identical value even though neither copy carries git metadata.
 TG_GIT_COMMIT="${TG_GIT_COMMIT:-$(tg_git_commit)}"
 export TG_GIT_COMMIT
+# "unknown" is what the helper reports when there is no readable git history.
+# It is still not a real commit, so keep going but do not let it pass silently:
+# a caller with no git (a CI job container, a clean-root copy) should pass the
+# commit explicitly so this build's GitCommit matches the release lane's.
+if [ "$TG_GIT_COMMIT" = unknown ]; then
+    echo "warning: TG_GIT_COMMIT is unset and git cannot name a commit under $REPO_ROOT" >&2
+    echo "warning: stamping 'unknown'; pass TG_GIT_COMMIT=<short sha> instead to" >&2
+    echo "warning: keep this build comparable with the release lane's." >&2
+fi
 
 case "$ARCH" in
     x86_64)                GOARCH=amd64;      SDK_TARGET=x86-64 ;;

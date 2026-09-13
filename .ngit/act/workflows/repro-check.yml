@@ -43,6 +43,11 @@ jobs:
     # scripts/repro-test.sh already builds with -buildvcs=false.
     env:
       GOFLAGS: -buildvcs=false
+      # scripts/repro-test.sh prefers the environment over its own git fallback
+      # for both byte-affecting inputs, and the step below exports them. This is
+      # the epoch used when nothing else can supply one; it is 0 (the unix
+      # epoch) so it is never mistaken for a real commit time in the output.
+      TG_REPRO_FALLBACK_EPOCH: "0"
     steps:
       - uses: actions/checkout@v5
       # The version is pinned explicitly to the one packaging/build-inputs.json
@@ -82,6 +87,40 @@ jobs:
             exit 1
           fi
           echo "go $have matches packaging/build-inputs.json"
+      - name: Export the reproducibility inputs the harness consumes
+        # This step exists because the act job workspace has no .git: act's
+        # local-checkout optimisation copies the tree into the job volume
+        # without the git directory, so the harness's own
+        # `git -C <workspace> log -1 --format=%ct HEAD` fails with
+        # `fatal: not a git repository` — which is exactly how this lane's
+        # first run went red, on the same `scripts/repro-test.sh binaries
+        # x86_64` call the GitHub workflow makes.
+        #
+        # scripts/repro-test.sh takes both values from the environment first and
+        # only then falls back to git, so exporting them here is what makes that
+        # call safe on this engine. ngit-ci injects GITHUB_SHA for the
+        # triggering commit, and `git rev-parse --short HEAD` is 7 characters in
+        # this repository, so TG_GIT_COMMIT below is the same value the release
+        # lane stamps. No commit *timestamp* reaches the job — the event payload
+        # for a push or manual trigger carries the commit id and nothing else —
+        # so SOURCE_DATE_EPOCH falls back to the fixed TG_REPRO_FALLBACK_EPOCH
+        # instead of a wall clock: the two build roots still agree byte for byte
+        # (that is what this lane checks), and the honest consequence is that
+        # its artifact hashes are not byte-comparable with a release build,
+        # whose epoch is the commit time. If the coordinator ever exposes a
+        # timestamp to the job, use it here and drop the fallback.
+        run: |
+          set -euo pipefail
+          epoch="${SOURCE_DATE_EPOCH:-$TG_REPRO_FALLBACK_EPOCH}"
+          sha="${GITHUB_SHA:-}"
+          commit="${TG_GIT_COMMIT:-${sha:0:7}}"
+          if [ -z "$commit" ]; then
+            echo "ERROR: no commit stamp available: GITHUB_SHA is unset and TG_GIT_COMMIT is empty" >&2
+            exit 1
+          fi
+          echo "SOURCE_DATE_EPOCH=$epoch" >> "${GITHUB_ENV:-/dev/null}"
+          echo "TG_GIT_COMMIT=$commit" >> "${GITHUB_ENV:-/dev/null}"
+          echo "epoch=$epoch commit=$commit"
       - name: Deterministic binary rebuild check (both binaries)
         # Prints BUILD 1 / BUILD 2 SHA-256s per binary and REPRODUCIBLE: YES|NO.
         # A target that produces no artifact is a failure, not a pass: the
