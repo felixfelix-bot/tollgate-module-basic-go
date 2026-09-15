@@ -1,0 +1,27 @@
+# Reviewed findings the releak scan may waive (see scripts/security/releak_scan.py).
+#
+# Format:  <sha256-12 fingerprint of the matched material>  <path>  # reason
+# Matching is on the fingerprint, so editing the material revokes the waiver
+# and the lane fails again. Adding an entry without a reason is not a review.
+#
+# Every entry below was inspected on 2026-09-15 and is a TEST FIXTURE, not a
+# funded or published identity. Details, with the material redacted:
+#
+#   bd5e72964950  src/identity_handler_test.go:17
+#       `const test... = "<64 hex>"` — deterministic key for the identity
+#       handler unit test. Test-only constant, never used to sign.
+#   9f32e487f11d  src/identity/identity_test.go:23
+#       `golden... = "<64 hex>"` — golden vector compared against, not a key
+#       the test ever loads into a signer.
+#   df732a439480  tests/cloud-lab/configs/reseller-identities.json:6
+#   df732a439480  tests/cloud-lab/configs/upstream-identities.json:6
+#       `"privatekey": "nsec1…"` in cloud-lab *sample* config: 52 bech32 data  # pragma: allowlist secret
+#       chars instead of the 58 a real nsec carries (see the repeating
+#       `q3qj6q` tail), so it does not decode to a secret key at all. The two
+#       files share the same placeholder string.
+#
+# A real key found here is a remediation task (remove + rotate), not an entry.
+bd5e72964950  src/identity_handler_test.go  # test fixture: deterministic test key constant
+9f32e487f11d  src/identity/identity_test.go  # test fixture: golden vector, never loaded as a signer
+df732a439480  tests/cloud-lab/configs/reseller-identities.json  # 52-char placeholder, not a valid nsec
+df732a439480  tests/cloud-lab/configs/upstream-identities.json  # 52-char placeholder, not a valid nsec

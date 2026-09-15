@@ -10,6 +10,7 @@ untouched and keeps running; the two systems run side by side.
 | --- | --- |
 | `act/workflows/go-test.yml` | The pre-PR sequence documented in [AGENTS.md](../AGENTS.md), run from `src/`: `gofmt -l .`, `go vet ./...`, `go build ./...`, `go test -race -count=1 -tags testenv ./...` (last step through `.github/scripts/go-test-summary.sh`). |
 | `act/workflows/test.yml` | The existing port of `.github/workflows/test.yml`: per-module Go tests over the module matrix, the main-package `testenv` test, `js-schema-lint`, `build-purity`, and the dependency/import-path checks. |
+| `act/workflows/releak-scan.yml` | Key-leak scan (`scripts/security/releak_scan.py`): the checked-out tree must contain no leaked Nostr secret material — no `nsec1…` bech32 secret, no 64-hex key assigned to a `nostr.nsec` / `secret_key` / `private_key` name. Self-contained (stdlib Python, no network, no secrets consumed); the job runs the detector's own self-test first, then scans. Findings are printed redacted (path:line + detector + SHA-256 fingerprint); four reviewed *test fixtures* are waived by fingerprint in `releak-allowlist.txt`. |
 
 Two files because they cover different things: `test.yml` tests the nested
 modules (which `./...` from `src/` does not reach — they are separate modules)
@@ -25,7 +26,9 @@ literal version takes a shorter path through `actions/setup-go`.
 
 ## Triggers
 
-Both files run on **push to `main`** and on **pull requests**. `schedule` is
+The Go lanes run on **push to `main`** and on **pull requests**; the releak
+scan additionally runs on `ci/**` branches, so a branch that edits the workflow
+or the scanner can run the lane before it lands on `main`. `schedule` is
 not supported by ngit-ci and is not used.
 
 **This deployment runs the `request-required` policy.** Ordinary push and PR
