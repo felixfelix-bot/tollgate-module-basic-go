@@ -1,7 +1,6 @@
 package tollwallet
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -13,15 +12,18 @@ import (
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut10"
 	"github.com/OpenTollGate/gonuts-tollgate/wallet"
 	"github.com/OpenTollGate/tollgate-module-basic-go/src/lightning"
+	"github.com/OpenTollGate/tollgate-module-basic-go/src/tollwallet/port"
 )
 
-var ErrTokenAlreadySpent = errors.New("Token already spent")
-var ErrLockedToken = errors.New("token has spending conditions and cannot be spent by the gateway")
-
-// ErrWalletNotInitialized is returned by wallet operations when the underlying
-// cashu wallet has not been initialized (for example on a bare Merchant or in
-// degraded mode), so callers get an error instead of a nil-pointer panic.
-var ErrWalletNotInitialized = errors.New("wallet not initialized")
+// Wallet-contract sentinel errors. These are aliases of the values defined in
+// the dependency-free port package (T16), not new errors: the identity is
+// preserved, so errors.Is(err, tollwallet.ErrTokenAlreadySpent) keeps working
+// for every adapter and the sentinels no longer require the concrete library.
+var (
+	ErrTokenAlreadySpent    = port.ErrTokenAlreadySpent
+	ErrLockedToken          = port.ErrLockedToken
+	ErrWalletNotInitialized = port.ErrWalletNotInitialized
+)
 
 type TollWallet struct {
 	wallet                     *wallet.Wallet
