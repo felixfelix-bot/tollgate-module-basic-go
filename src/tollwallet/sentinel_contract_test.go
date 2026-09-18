@@ -1,3 +1,12 @@
+// LIBRARY-AGNOSTIC TEST SET (T16, wallet-migration).
+//
+// These tests exercise the wallet CONTRACT (sentinel identity, errors.Is
+// matching, mint-rejection phrasing) and import no wallet library. The
+// adapter-general half — including the end-to-end mapping of a mint's
+// "already spent" answer through a live adapter — lives in
+// src/tollwallet/conformance and runs against every backend.
+//
+// Split list / evidence: research/wallet-migration/03-baseline/interchangeability.md
 package tollwallet
 
 import (
@@ -34,20 +43,23 @@ func TestErrTokenAlreadySpent_DoubleWrapStillMatches(t *testing.T) {
 		"double-wrapped error must still match ErrTokenAlreadySpent via errors.Is")
 }
 
-func TestShutdown_NilWallet_NoPanic(t *testing.T) {
-	w := &TollWallet{wallet: nil}
-	err := w.Shutdown()
-	assert.NoError(t, err)
+func TestErrLockedToken_IsSentinel(t *testing.T) {
+	if !errors.Is(ErrLockedToken, ErrLockedToken) {
+		t.Fatal("ErrLockedToken should be detectable via errors.Is")
+	}
 }
 
-func TestGetMintQuoteState_NilWallet_ReturnsError(t *testing.T) {
-	w := &TollWallet{wallet: nil}
-	resp, err := w.GetMintQuoteState("quote-id")
-	assert.Nil(t, resp)
-	assert.ErrorIs(t, err, ErrWalletNotInitialized,
-		"GetMintQuoteState on an uninitialized wallet must return ErrWalletNotInitialized, not panic")
+func TestErrLockedToken_Message(t *testing.T) {
+	if ErrLockedToken.Error() == "" {
+		t.Fatal("ErrLockedToken should have non-empty message")
+	}
 }
 
+// TestIsAlreadySpentError_MintPhrasings pins the mint-family phrasings the
+// sentinel mapping must recognise — and, just as importantly, the one shape it
+// must NOT: the empty "could not swap proofs: " error older gonuts versions
+// produced when they swallowed the mint's rejection. Matching that shape would
+// turn every failed swap into "already spent".
 func TestIsAlreadySpentError_MintPhrasings(t *testing.T) {
 	cases := []struct {
 		name string

@@ -1,5 +1,16 @@
 //go:build testenv
 
+// LIBRARY-SPECIFIC TEST SET (T16, wallet-migration).
+//
+// These tests assert behaviour of the concrete gonuts-tollgate wallet that the
+// library-agnostic WalletPort contract cannot express, and they are kept apart
+// from the adapter-general suite in src/tollwallet/conformance (which imports no
+// wallet library at all). Reason per file below.
+//
+// Split list / evidence: research/wallet-migration/03-baseline/interchangeability.md
+// Reason: it measures the cost of the gonuts adapter's wrapper types
+// (gonutsToken allocation, interface dispatch) against raw cashu.DecodeToken.
+// The comparison is only meaningful for this library's implementation.
 package tollwallet
 
 import (

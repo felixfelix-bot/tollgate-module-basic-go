@@ -1,23 +1,25 @@
+// LIBRARY-SPECIFIC TEST SET (T16, wallet-migration).
+//
+// These tests assert behaviour of the concrete gonuts-tollgate wallet that the
+// library-agnostic WalletPort contract cannot express, and they are kept apart
+// from the adapter-general suite in src/tollwallet/conformance (which imports no
+// wallet library at all). Reason per file below.
+//
+// Split list / evidence: research/wallet-migration/03-baseline/interchangeability.md
+//
+// Reason: they call hasLockedProofs(cashu.Proofs) — a unit-level assertion on a
+// gonuts-typed helper. The library-independent version of the same contract
+// ("a token whose secret is a P2PK/HTLC spending condition is refused with
+// port.ErrLockedToken") is asserted generically in the conformance suite's
+// receive_contract/locked_proof_rejected case, which runs against this adapter
+// as well as any future one.
 package tollwallet
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 )
-
-func TestErrLockedToken_IsSentinel(t *testing.T) {
-	if !errors.Is(ErrLockedToken, ErrLockedToken) {
-		t.Fatal("ErrLockedToken should be detectable via errors.Is")
-	}
-}
-
-func TestErrLockedToken_Message(t *testing.T) {
-	if ErrLockedToken.Error() == "" {
-		t.Fatal("ErrLockedToken should have non-empty message")
-	}
-}
 
 func TestHasSpendingCondition_PlainSecret(t *testing.T) {
 	proofs := cashu.Proofs{

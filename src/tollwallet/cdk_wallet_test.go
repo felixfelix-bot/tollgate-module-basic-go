@@ -1,5 +1,16 @@
 //go:build cdk_wallet && testenv
 
+// LIBRARY-SPECIFIC TEST SET (T16, wallet-migration).
+//
+// These tests assert behaviour of the concrete gonuts-tollgate wallet that the
+// library-agnostic WalletPort contract cannot express, and they are kept apart
+// from the adapter-general suite in src/tollwallet/conformance (which imports no
+// wallet library at all). Reason per file below.
+//
+// Split list / evidence: research/wallet-migration/03-baseline/interchangeability.md
+// Reason: it tests the cdk-go adapter specifically (CDK error codes, CGO
+// lifecycle, mnemonic persistence). The library-independent half of the same
+// contracts is asserted in conformance/, which a cdk build can run unchanged.
 package tollwallet
 
 import (

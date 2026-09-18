@@ -1,3 +1,16 @@
+// LIBRARY-SPECIFIC TEST SET (T16, wallet-migration).
+//
+// These tests assert behaviour of the concrete gonuts-tollgate wallet that the
+// library-agnostic WalletPort contract cannot express, and they are kept apart
+// from the adapter-general suite in src/tollwallet/conformance (which imports no
+// wallet library at all). Reason per file below.
+//
+// Split list / evidence: research/wallet-migration/03-baseline/interchangeability.md
+// Reason: it pins gonuts's NUT-00 hash_to_curve against cross-implementation
+// vectors. The BDHKE crypto is not on the WalletPort surface at all (the port
+// deals in tokens, amounts, quotes and balances), so this assertion cannot be
+// re-expressed through the port without inventing a crypto method that the
+// merchant never calls.
 package tollwallet
 
 import (
