@@ -13,7 +13,7 @@ vendor/
 tollgate
 tollgate-wrt
 tollgate-module-basic-go
-tollgate-cli
+src/cmd/tollgate-cli/tollgate-cli
 *.exe
 
 # Test artifacts

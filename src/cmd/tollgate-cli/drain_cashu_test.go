@@ -207,10 +207,12 @@ func runCLIInProcess(t *testing.T, stdin string, args ...string) (string, string
 	t.Helper()
 
 	// cobra writes its flags into package-level variables that outlive a single
-	// Execute call, so reset the ones this command reads. Any new flag added to
-	// drainCashuCmd (or read by it) must be reset here too.
+	// Execute call, so reset the ones these commands read. Any new flag added to
+	// drainCashuCmd or the ssl commands (and read by them) must be reset here
+	// too.
 	jsonOutput = false
 	drainCashuYes = false
+	sslYesFlag = false
 
 	stdinFile, err := os.CreateTemp(t.TempDir(), "stdin")
 	if err != nil {

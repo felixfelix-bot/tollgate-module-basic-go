@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -27,19 +28,157 @@ var (
 
 var sslYesFlag bool
 
-func runCommand(name string, args ...string) (string, error) {
+// runCommand runs an external command (uci, the init scripts) and returns its
+// combined output. It is a variable so tests can drive the ssl flows without a
+// router: there is no `uci` binary, no /etc/init.d/uhttpd and no
+// /etc/tollgate/ssl on a workstation.
+var runCommand = func(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
 func runCommandChecked(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := runCommand(name, args...)
 	if err != nil {
-		return fmt.Errorf("%s %s: %s: %w", name, strings.Join(args, " "), strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("%s %s: %s: %w", name, strings.Join(args, " "), strings.TrimSpace(out), err)
 	}
 	return nil
+}
+
+// sslProgress collects the human-readable progress lines of the ssl command
+// currently running when --json was requested. They become the `progress` array
+// of the JSON payload instead of being mixed into it as prose. It is reset at
+// the start of every ssl command.
+var sslProgress []string
+
+// sslPrintf and sslPrintln write the human-readable progress of the ssl
+// commands. Under --json they are silent on stdout and the line is collected
+// for the JSON payload instead, so `--json` prints exactly one JSON object.
+func sslPrintf(format string, args ...interface{}) {
+	sslEmit(fmt.Sprintf(format, args...))
+}
+
+func sslPrintln(args ...interface{}) {
+	sslEmit(fmt.Sprintln(args...))
+}
+
+func sslEmit(text string) {
+	if jsonOutput {
+		sslProgress = append(sslProgress, strings.Split(strings.TrimRight(text, "\n"), "\n")...)
+		return
+	}
+	fmt.Fprint(os.Stdout, text)
+}
+
+// sslResult is the --json payload of `tollgate ssl apply` and `ssl remove`.
+//
+// These commands change router state, so the exit status carries the outcome
+// too: 0 = applied or reverted, 1 = attempted and failed, 2 = the confirmation
+// was declined and nothing changed (then `cancelled` is true and `changed`
+// false). `changed` is true as soon as the run has modified router state, so a
+// run that failed part-way reports `changed:true` together with
+// `success:false`. `progress` holds the same lines the human-readable mode
+// prints.
+type sslResult struct {
+	Success   bool     `json:"success"`
+	Action    string   `json:"action"`
+	Mode      string   `json:"mode,omitempty"`
+	Domain    string   `json:"domain,omitempty"`
+	Cert      string   `json:"cert"`
+	Key       string   `json:"key"`
+	BackupDir string   `json:"backup_dir"`
+	Changed   bool     `json:"changed"`
+	Cancelled bool     `json:"cancelled,omitempty"`
+	Progress  []string `json:"progress,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Timestamp string   `json:"timestamp"`
+}
+
+// sslReport accumulates the outcome of one `ssl apply` / `ssl remove` run.
+type sslReport struct {
+	action    string
+	mode      string
+	domain    string
+	changed   bool
+	cancelled bool
+}
+
+func newSSLReport(action string) *sslReport {
+	sslProgress = nil
+	return &sslReport{action: action}
+}
+
+// abort records a declined confirmation and returns the cancelled exit status,
+// the same contract as a cancelled `wallet drain cashu` (#375) and a cancelled
+// `network private disable`: the caller must be able to tell that nothing
+// happened.
+func (r *sslReport) abort() error {
+	sslPrintln("Aborted.")
+	r.cancelled = true
+	r.changed = false
+	return errCancelled
+}
+
+// finish reports the run. The human-readable progress was already written as it
+// happened; under --json the whole outcome becomes one JSON object on stdout.
+func (r *sslReport) finish(err error) error {
+	if !jsonOutput {
+		return err
+	}
+
+	result := sslResult{
+		Success:   err == nil,
+		Action:    r.action,
+		Mode:      r.mode,
+		Domain:    r.domain,
+		Cert:      certDest,
+		Key:       keyDest,
+		BackupDir: backupDir,
+		Changed:   r.changed,
+		Cancelled: r.cancelled || errors.Is(err, errCancelled),
+		Progress:  sslProgress,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	if err != nil {
+		result.Error = err.Error()
+	}
+	if printErr := printJSON(result); printErr != nil {
+		return printErr
+	}
+	return err
+}
+
+// sslStatusResult is the --json payload of `tollgate ssl status`.
+//
+// ssl status is read-only and does not talk to the TollGate service, so it
+// always exits 0 -- the read-only rule in docs/operator-guide.md: the state,
+// including a certificate that is installed but cannot be read or parsed, is
+// reported in this object.
+type sslStatusResult struct {
+	Success       bool     `json:"success"`
+	Configured    bool     `json:"configured"`
+	Mode          string   `json:"mode,omitempty"`
+	Domain        string   `json:"domain,omitempty"`
+	Cert          string   `json:"cert"`
+	Key           string   `json:"key"`
+	Subject       string   `json:"subject,omitempty"`
+	Issuer        string   `json:"issuer,omitempty"`
+	NotBefore     string   `json:"not_before,omitempty"`
+	NotAfter      string   `json:"not_after,omitempty"`
+	DaysRemaining *int     `json:"days_remaining,omitempty"`
+	Expired       bool     `json:"expired,omitempty"`
+	SANs          []string `json:"san,omitempty"`
+	Error         string   `json:"error,omitempty"`
+	Timestamp     string   `json:"timestamp"`
+}
+
+func (r sslStatusResult) finish() error {
+	if !jsonOutput {
+		return nil
+	}
+	sslProgress = nil
+	return printJSON(r)
 }
 
 var sslCmd = &cobra.Command{
@@ -55,7 +194,12 @@ var sslApplyCmd = &cobra.Command{
 
 Without arguments, generates a self-signed certificate for the router's hostname.
 With a single PEM file, splits combined cert+key.
-With two files, uses separate cert and key files.`,
+With two files, uses separate cert and key files.
+
+With --json the outcome is reported as a single JSON object on stdout instead of
+the human-readable progress, and the exit status reports it too: 0 = applied,
+1 = the apply was attempted and failed, 2 = the confirmation was declined and
+nothing changed.`,
 	Args: cobra.MaximumNArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return sslApply(args)
@@ -65,8 +209,13 @@ With two files, uses separate cert and key files.`,
 var sslRemoveCmd = &cobra.Command{
 	Use:   "remove",
 	Short: "Remove SSL configuration",
-	Long:  "Revert SSL changes made by 'ssl apply', restoring previous state",
-	Args:  cobra.NoArgs,
+	Long: `Revert SSL changes made by 'ssl apply', restoring previous state.
+
+With --json the outcome is reported as a single JSON object on stdout instead of
+the human-readable progress, and the exit status reports it too: 0 = reverted,
+1 = the revert was attempted and failed, 2 = the confirmation was declined and
+nothing changed.`,
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return sslRemove()
 	},
@@ -75,8 +224,13 @@ var sslRemoveCmd = &cobra.Command{
 var sslStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show SSL status",
-	Long:  "Display current SSL certificate configuration and status",
-	Args:  cobra.NoArgs,
+	Long: `Display current SSL certificate configuration and status.
+
+With --json the state is reported as a single JSON object on stdout (success,
+configured, mode, domain, cert, key and the parsed certificate fields). It is a
+read-only command, so it always exits 0 and reports a certificate it cannot read
+or parse inside that object.`,
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return sslStatus()
 	},
@@ -97,6 +251,11 @@ func confirmOrYes(msg string) bool {
 }
 
 func sslApply(args []string) error {
+	report := newSSLReport("apply")
+	return report.finish(sslApplyRun(report, args))
+}
+
+func sslApplyRun(report *sslReport, args []string) error {
 	cleanupStaleTempDirs()
 
 	lanIP, err := uciGet("network.lan.ipaddr")
@@ -105,28 +264,29 @@ func sslApply(args []string) error {
 	}
 
 	if _, err := os.Stat(backupDir); err == nil {
-		fmt.Println("WARNING: SSL backup already exists (SSL may already be applied).")
-		fmt.Println("  Run 'tollgate ssl remove' first to cleanly revert.")
+		sslPrintln("WARNING: SSL backup already exists (SSL may already be applied).")
+		sslPrintln("  Run 'tollgate ssl remove' first to cleanly revert.")
 		if !confirmOrYes("Overwrite backup and re-apply?") {
-			fmt.Println("Aborted.")
-			return nil
+			return report.abort()
 		}
 	}
 
 	if len(args) == 0 {
-		return sslApplySelfSigned(lanIP)
+		return sslApplySelfSigned(report, lanIP)
 	}
-	return sslApplyRealCert(args, lanIP)
+	return sslApplyRealCert(report, args, lanIP)
 }
 
-func sslApplySelfSigned(lanIP string) error {
+func sslApplySelfSigned(report *sslReport, lanIP string) error {
 	hostname, err := uciGet("system.@system[0].hostname")
 	if err != nil || hostname == "" {
 		hostname = "TollGate"
 	}
 	domain := hostname + ".lan"
+	report.mode = "self-signed"
+	report.domain = domain
 
-	fmt.Printf("Generating self-signed certificate for %s...\n", domain)
+	sslPrintf("Generating self-signed certificate for %s...\n", domain)
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -167,62 +327,62 @@ func sslApplySelfSigned(lanIP string) error {
 		return err
 	}
 
-	fmt.Println()
-	fmt.Println("Certificate details:")
-	fmt.Printf("  Domain : %s (self-signed)\n", domain)
-	fmt.Println("  Expires: 10 years")
-	fmt.Printf("  LAN IP : %s\n", lanIP)
-	fmt.Println()
-	fmt.Println("  NOTE: Self-signed certs are NOT trusted by browsers or RFC 8908 clients.")
-	fmt.Println("  The captive portal will continue using HTTP interception.")
-	fmt.Println("  LuCI admin will be accessible via HTTPS with a browser warning.")
-	fmt.Println()
+	sslPrintln()
+	sslPrintln("Certificate details:")
+	sslPrintf("  Domain : %s (self-signed)\n", domain)
+	sslPrintln("  Expires: 10 years")
+	sslPrintf("  LAN IP : %s\n", lanIP)
+	sslPrintln()
+	sslPrintln("  NOTE: Self-signed certs are NOT trusted by browsers or RFC 8908 clients.")
+	sslPrintln("  The captive portal will continue using HTTP interception.")
+	sslPrintln("  LuCI admin will be accessible via HTTPS with a browser warning.")
+	sslPrintln()
 
-	fmt.Println("Changes to apply:")
-	fmt.Printf("  [1] Install self-signed cert+key to %s/\n", sslDir)
-	fmt.Printf("  [2] uhttpd: set cert='%s' key='%s'\n", certDest, keyDest)
-	fmt.Println("  [3] nodogsplash: allow tcp port 443 so clients can reach uhttpd HTTPS")
-	fmt.Println()
+	sslPrintln("Changes to apply:")
+	sslPrintf("  [1] Install self-signed cert+key to %s/\n", sslDir)
+	sslPrintf("  [2] uhttpd: set cert='%s' key='%s'\n", certDest, keyDest)
+	sslPrintln("  [3] nodogsplash: allow tcp port 443 so clients can reach uhttpd HTTPS")
+	sslPrintln()
 
 	if !confirmOrYes("Apply all?") {
-		fmt.Println("Aborted.")
-		return nil
+		return report.abort()
 	}
 
 	if err := sslBackup("self-signed", domain, lanIP); err != nil {
 		return fmt.Errorf("backup failed: %w", err)
 	}
+	report.changed = true
 
 	if err := sslInstallCerts(certFile, keyFile); err != nil {
 		return err
 	}
-	fmt.Println("[1] Self-signed certificate installed.")
+	sslPrintln("[1] Self-signed certificate installed.")
 
 	if err := configureUhttpd(); err != nil {
 		return err
 	}
-	fmt.Println("[2] uhttpd configured.")
+	sslPrintln("[2] uhttpd configured.")
 
 	if err := allowPort443(); err != nil {
 		return err
 	}
-	fmt.Println("[3] nodogsplash firewall updated.")
+	sslPrintln("[3] nodogsplash firewall updated.")
 
 	if err := reloadServices(false); err != nil {
 		return err
 	}
 
-	fmt.Println()
-	fmt.Printf("Done. Self-signed HTTPS enabled for %s\n", domain)
-	fmt.Println()
-	fmt.Printf("  Portal URL: http://%s/ (NoDogSplash, HTTP only)\n", domain)
-	fmt.Printf("  LuCI URL:   https://%s/ (uhttpd, HTTPS, self-signed)\n", domain)
-	fmt.Println()
-	fmt.Println("To revert: tollgate ssl remove")
+	sslPrintln()
+	sslPrintf("Done. Self-signed HTTPS enabled for %s\n", domain)
+	sslPrintln()
+	sslPrintf("  Portal URL: http://%s/ (NoDogSplash, HTTP only)\n", domain)
+	sslPrintf("  LuCI URL:   https://%s/ (uhttpd, HTTPS, self-signed)\n", domain)
+	sslPrintln()
+	sslPrintln("To revert: tollgate ssl remove")
 	return nil
 }
 
-func sslApplyRealCert(args []string, lanIP string) error {
+func sslApplyRealCert(report *sslReport, args []string, lanIP string) error {
 	certFile := args[0]
 	keyFile := ""
 	if len(args) == 2 {
@@ -262,119 +422,128 @@ func sslApplyRealCert(args []string, lanIP string) error {
 	}
 
 	if time.Now().After(cert.NotAfter) {
-		fmt.Println("WARNING: certificate has expired!")
-		fmt.Println("  Continuing anyway — the cert will be installed but browsers will reject it.")
+		sslPrintln("WARNING: certificate has expired!")
+		sslPrintln("  Continuing anyway — the cert will be installed but browsers will reject it.")
 	}
 
 	domain := extractDomain(cert)
 	if domain == "" {
 		return fmt.Errorf("could not extract domain from certificate (no SAN or CN found)")
 	}
+	report.mode = "real-cert"
+	report.domain = domain
 
-	fmt.Println()
-	fmt.Println("Certificate details:")
-	fmt.Printf("  Domain : %s\n", domain)
-	fmt.Printf("  Expires: %s\n", cert.NotAfter.Format("Jan 2 15:04:05 2006 MST"))
-	fmt.Printf("  SAN    : %s\n", strings.Join(cert.DNSNames, ", "))
-	fmt.Printf("  LAN IP : %s\n", lanIP)
-	fmt.Println()
+	sslPrintln()
+	sslPrintln("Certificate details:")
+	sslPrintf("  Domain : %s\n", domain)
+	sslPrintf("  Expires: %s\n", cert.NotAfter.Format("Jan 2 15:04:05 2006 MST"))
+	sslPrintf("  SAN    : %s\n", strings.Join(cert.DNSNames, ", "))
+	sslPrintf("  LAN IP : %s\n", lanIP)
+	sslPrintln()
 
-	fmt.Println("Changes to apply:")
-	fmt.Printf("  [1] Install cert+key to %s/\n", sslDir)
-	fmt.Printf("  [2] uhttpd: set cert='%s' key='%s'\n", certDest, keyDest)
-	fmt.Printf("  [3] dnsmasq: resolve %s -> %s\n", domain, lanIP)
-	fmt.Printf("  [4] nodogsplash: gatewaydomainname='%s' (portal stays on HTTP port 80)\n", domain)
-	fmt.Println("  [5] nodogsplash: allow tcp port 443 so clients can reach uhttpd HTTPS")
-	fmt.Println()
+	sslPrintln("Changes to apply:")
+	sslPrintf("  [1] Install cert+key to %s/\n", sslDir)
+	sslPrintf("  [2] uhttpd: set cert='%s' key='%s'\n", certDest, keyDest)
+	sslPrintf("  [3] dnsmasq: resolve %s -> %s\n", domain, lanIP)
+	sslPrintf("  [4] nodogsplash: gatewaydomainname='%s' (portal stays on HTTP port 80)\n", domain)
+	sslPrintln("  [5] nodogsplash: allow tcp port 443 so clients can reach uhttpd HTTPS")
+	sslPrintln()
 
 	if !confirmOrYes("Apply all?") {
-		fmt.Println("Aborted.")
-		return nil
+		return report.abort()
 	}
 
 	if err := sslBackup("real-cert", domain, lanIP); err != nil {
 		return fmt.Errorf("backup failed: %w", err)
 	}
+	report.changed = true
 
 	if err := sslInstallCerts(certFile, keyFile); err != nil {
 		return err
 	}
-	fmt.Println("[1] Certificate installed.")
+	sslPrintln("[1] Certificate installed.")
 
 	if err := configureUhttpd(); err != nil {
 		return err
 	}
-	fmt.Println("[2] uhttpd configured.")
+	sslPrintln("[2] uhttpd configured.")
 
 	if err := configureDnsmasq(domain, lanIP); err != nil {
 		return err
 	}
-	fmt.Printf("[3] dnsmasq configured: %s -> %s\n", domain, lanIP)
+	sslPrintf("[3] dnsmasq configured: %s -> %s\n", domain, lanIP)
 
 	if err := configureNodogsplash(domain); err != nil {
 		return err
 	}
-	fmt.Println("[4] nodogsplash configured.")
+	sslPrintln("[4] nodogsplash configured.")
 
 	if err := allowPort443(); err != nil {
 		return err
 	}
-	fmt.Println("[5] nodogsplash firewall updated.")
+	sslPrintln("[5] nodogsplash firewall updated.")
 
 	if err := reloadServices(true); err != nil {
 		return err
 	}
 
-	fmt.Println()
-	fmt.Printf("Done. HTTPS enabled for %s\n", domain)
-	fmt.Println()
-	fmt.Printf("  Portal URL: http://%s/ (NoDogSplash, HTTP only)\n", domain)
-	fmt.Printf("  LuCI URL:   https://%s/ (uhttpd, HTTPS)\n", domain)
-	fmt.Println()
-	fmt.Println("To revert: tollgate ssl remove")
+	sslPrintln()
+	sslPrintf("Done. HTTPS enabled for %s\n", domain)
+	sslPrintln()
+	sslPrintf("  Portal URL: http://%s/ (NoDogSplash, HTTP only)\n", domain)
+	sslPrintf("  LuCI URL:   https://%s/ (uhttpd, HTTPS)\n", domain)
+	sslPrintln()
+	sslPrintln("To revert: tollgate ssl remove")
 	return nil
 }
 
 func sslRemove() error {
+	report := newSSLReport("remove")
+	return report.finish(sslRemoveRun(report))
+}
+
+func sslRemoveRun(report *sslReport) error {
 	if _, err := os.Stat(backupDir); os.IsNotExist(err) {
 		return fmt.Errorf("no SSL backup found at %s/\n  Either SSL was never applied, or the backup was deleted", backupDir)
 	}
 
 	domain := fileRead(backupDir + "/ssl.domain")
 	mode := fileRead(backupDir + "/ssl.mode")
+	report.mode = mode
+	report.domain = domain
 
 	if mode == "self-signed" {
-		return sslRemoveSelfSigned(domain)
+		return sslRemoveSelfSigned(report, domain)
 	}
-	return sslRemoveRealCert(domain)
+	return sslRemoveRealCert(report, domain)
 }
 
-func sslRemoveSelfSigned(domain string) error {
-	fmt.Printf("Reverting self-signed SSL configuration for: %s\n", domain)
-	fmt.Println()
-	fmt.Println("Changes to revert:")
-	fmt.Printf("  [1] Remove self-signed cert+key from %s/\n", sslDir)
-	fmt.Println("  [2] uhttpd: restore previous cert configuration")
-	fmt.Println("  [3] nodogsplash: remove port 443 allow rule")
-	fmt.Println()
+func sslRemoveSelfSigned(report *sslReport, domain string) error {
+	sslPrintf("Reverting self-signed SSL configuration for: %s\n", domain)
+	sslPrintln()
+	sslPrintln("Changes to revert:")
+	sslPrintf("  [1] Remove self-signed cert+key from %s/\n", sslDir)
+	sslPrintln("  [2] uhttpd: restore previous cert configuration")
+	sslPrintln("  [3] nodogsplash: remove port 443 allow rule")
+	sslPrintln()
 
 	if !confirmOrYes("Revert all?") {
-		fmt.Println("Aborted.")
-		return nil
+		return report.abort()
 	}
 
 	os.Remove(certDest)
 	os.Remove(keyDest)
+	report.changed = true
 
 	if err := restoreUhttpd(); err != nil {
 		return err
 	}
-	fmt.Println("[1] uhttpd cert reverted.")
+	sslPrintln("[1] uhttpd cert reverted.")
 
 	if err := removePort443Allow(); err != nil {
 		return err
 	}
-	fmt.Println("[2] nodogsplash firewall updated.")
+	sslPrintln("[2] nodogsplash firewall updated.")
 
 	if err := uciCommitChecked("uhttpd"); err != nil {
 		return err
@@ -388,39 +557,39 @@ func sslRemoveSelfSigned(domain string) error {
 
 	os.RemoveAll(backupDir)
 
-	fmt.Println()
-	fmt.Println("Done. Self-signed HTTPS removed.")
-	fmt.Println("  Portal URL: http://TollGate.lan/")
+	sslPrintln()
+	sslPrintln("Done. Self-signed HTTPS removed.")
+	sslPrintln("  Portal URL: http://TollGate.lan/")
 	return nil
 }
 
-func sslRemoveRealCert(domain string) error {
-	fmt.Printf("Reverting SSL configuration for: %s\n", domain)
-	fmt.Println()
-	fmt.Println("Changes to revert:")
-	fmt.Printf("  [1] Remove cert+key from %s/\n", sslDir)
-	fmt.Println("  [2] uhttpd: restore previous cert configuration")
-	fmt.Printf("  [3] dnsmasq: remove DNS entry for %s\n", domain)
-	fmt.Println("  [4] nodogsplash: revert gatewaydomainname and remove port 443 allow")
-	fmt.Println()
+func sslRemoveRealCert(report *sslReport, domain string) error {
+	sslPrintf("Reverting SSL configuration for: %s\n", domain)
+	sslPrintln()
+	sslPrintln("Changes to revert:")
+	sslPrintf("  [1] Remove cert+key from %s/\n", sslDir)
+	sslPrintln("  [2] uhttpd: restore previous cert configuration")
+	sslPrintf("  [3] dnsmasq: remove DNS entry for %s\n", domain)
+	sslPrintln("  [4] nodogsplash: revert gatewaydomainname and remove port 443 allow")
+	sslPrintln()
 
 	if !confirmOrYes("Revert all?") {
-		fmt.Println("Aborted.")
-		return nil
+		return report.abort()
 	}
 
 	os.Remove(certDest)
 	os.Remove(keyDest)
+	report.changed = true
 
 	if err := restoreUhttpd(); err != nil {
 		return err
 	}
-	fmt.Println("[1] uhttpd cert reverted.")
+	sslPrintln("[1] uhttpd cert reverted.")
 
 	if err := removeDnsmasqDomain(domain); err != nil {
 		return err
 	}
-	fmt.Printf("[2] Removed dnsmasq entry for %s\n", domain)
+	sslPrintf("[2] Removed dnsmasq entry for %s\n", domain)
 
 	originalDomain := fileRead(backupDir + "/nds.gatewaydomainname")
 	if originalDomain == "" {
@@ -439,7 +608,7 @@ func sslRemoveRealCert(domain string) error {
 	if err := removePort443Allow(); err != nil {
 		return err
 	}
-	fmt.Printf("[3] nodogsplash reverted to %s:%s\n", originalDomain, originalPort)
+	sslPrintf("[3] nodogsplash reverted to %s:%s\n", originalDomain, originalPort)
 
 	if err := uciCommitChecked("uhttpd"); err != nil {
 		return err
@@ -456,53 +625,88 @@ func sslRemoveRealCert(domain string) error {
 
 	os.RemoveAll(backupDir)
 
-	fmt.Println()
-	fmt.Println("Done. HTTPS removed. Portal now served over HTTP.")
-	fmt.Printf("  Portal URL: http://%s/\n", originalDomain)
+	sslPrintln()
+	sslPrintln("Done. HTTPS removed. Portal now served over HTTP.")
+	sslPrintf("  Portal URL: http://%s/\n", originalDomain)
 	return nil
 }
 
 func sslStatus() error {
+	sslProgress = nil
+
 	mode := fileRead(backupDir + "/ssl.mode")
 	domain := fileRead(backupDir + "/ssl.domain")
 
-	if _, err := os.Stat(certDest); os.IsNotExist(err) {
-		fmt.Println("SSL: not configured")
-		fmt.Println("  Run 'tollgate ssl apply' to generate a self-signed certificate")
-		fmt.Println("  Run 'tollgate ssl apply <cert> [key]' to install a real certificate")
-		return nil
+	result := sslStatusResult{
+		Success:   true,
+		Mode:      mode,
+		Domain:    domain,
+		Cert:      certDest,
+		Key:       keyDest,
+		Timestamp: time.Now().Format(time.RFC3339),
 	}
 
-	fmt.Println("SSL: configured")
-	fmt.Printf("  Mode   : %s\n", mode)
-	fmt.Printf("  Domain : %s\n", domain)
-	fmt.Printf("  Cert   : %s\n", certDest)
-	fmt.Printf("  Key    : %s\n", keyDest)
+	if _, err := os.Stat(certDest); os.IsNotExist(err) {
+		sslPrintln("SSL: not configured")
+		sslPrintln("  Run 'tollgate ssl apply' to generate a self-signed certificate")
+		sslPrintln("  Run 'tollgate ssl apply <cert> [key]' to install a real certificate")
+		return result.finish()
+	}
+
+	result.Configured = true
+	sslPrintln("SSL: configured")
+	sslPrintf("  Mode   : %s\n", mode)
+	sslPrintf("  Domain : %s\n", domain)
+	sslPrintf("  Cert   : %s\n", certDest)
+	sslPrintf("  Key    : %s\n", keyDest)
 
 	certPEM, err := os.ReadFile(certDest)
-	if err == nil {
-		block, _ := pem.Decode(certPEM)
-		if block != nil {
-			cert, err := x509.ParseCertificate(block.Bytes)
-			if err == nil {
-				fmt.Printf("  Subject: %s\n", cert.Subject)
-				fmt.Printf("  Issuer : %s\n", cert.Issuer)
-				fmt.Printf("  NotBefore: %s\n", cert.NotBefore.Format("2006-01-02 15:04:05"))
-				fmt.Printf("  NotAfter : %s\n", cert.NotAfter.Format("2006-01-02 15:04:05"))
-				if time.Now().After(cert.NotAfter) {
-					fmt.Println("  WARNING: certificate has EXPIRED")
-				} else {
-					daysLeft := int(time.Until(cert.NotAfter).Hours() / 24)
-					fmt.Printf("  Days remaining: %d\n", daysLeft)
-				}
-				if len(cert.DNSNames) > 0 {
-					fmt.Printf("  SAN    : %s\n", strings.Join(cert.DNSNames, ", "))
-				}
-			}
-		}
+	if err != nil {
+		result.Success = false
+		result.Error = fmt.Sprintf("cannot read the installed certificate at %s: %v", certDest, err)
+		return result.finish()
 	}
 
-	return nil
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		result.Success = false
+		result.Error = fmt.Sprintf("cannot parse the installed certificate at %s: no PEM block found", certDest)
+		return result.finish()
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		result.Success = false
+		result.Error = fmt.Sprintf("cannot parse the installed certificate at %s: %v", certDest, err)
+		return result.finish()
+	}
+
+	result.Subject = cert.Subject.String()
+	result.Issuer = cert.Issuer.String()
+	result.NotBefore = cert.NotBefore.Format("2006-01-02 15:04:05")
+	result.NotAfter = cert.NotAfter.Format("2006-01-02 15:04:05")
+	result.SANs = cert.DNSNames
+	if time.Now().After(cert.NotAfter) {
+		result.Expired = true
+	} else {
+		daysLeft := int(time.Until(cert.NotAfter).Hours() / 24)
+		result.DaysRemaining = &daysLeft
+	}
+
+	sslPrintf("  Subject: %s\n", cert.Subject)
+	sslPrintf("  Issuer : %s\n", cert.Issuer)
+	sslPrintf("  NotBefore: %s\n", result.NotBefore)
+	sslPrintf("  NotAfter : %s\n", result.NotAfter)
+	if result.Expired {
+		sslPrintln("  WARNING: certificate has EXPIRED")
+	} else {
+		sslPrintf("  Days remaining: %d\n", *result.DaysRemaining)
+	}
+	if len(cert.DNSNames) > 0 {
+		sslPrintf("  SAN    : %s\n", strings.Join(cert.DNSNames, ", "))
+	}
+
+	return result.finish()
 }
 
 func writePEM(path, pemType string, bytes []byte) error {
@@ -594,7 +798,7 @@ func sslBackup(mode, domain, lanIP string) error {
 	lines := filterLines(out, "=domain")
 	writeBackupFile(backupDir+"/dnsmasq.domains", strings.Join(lines, "\n"))
 
-	fmt.Printf("Backup saved to %s/\n", backupDir)
+	sslPrintf("Backup saved to %s/\n", backupDir)
 	return nil
 }
 

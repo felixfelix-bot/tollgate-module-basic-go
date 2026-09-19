@@ -16,7 +16,15 @@ import (
 )
 
 func askConfirmation(message string) bool {
-	fmt.Printf("%s (y/N): ", message)
+	prompt := fmt.Sprintf("%s (y/N): ", message)
+	// Under --json stdout carries exactly one JSON object (or one object per
+	// line for a streaming command), so the interactive prompt goes to stderr:
+	// a terminal still shows it, and a parser still gets clean JSON.
+	if jsonOutput {
+		fmt.Fprint(os.Stderr, prompt)
+	} else {
+		fmt.Print(prompt)
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 	if !scanner.Scan() {
 		return false
@@ -328,12 +336,19 @@ var upstreamScanCmd = &cobra.Command{
 var upstreamConnectCmd = &cobra.Command{
 	Use:   "connect <SSID> [passphrase]",
 	Short: "Connect to an upstream WiFi network",
-	Long:  "Connect to an upstream WiFi network. Disables the current upstream, preserving it as a known candidate.",
-	Args:  cobra.MinimumNArgs(1),
+	Long: `Connect to an upstream WiFi network. Disables the current upstream, preserving it as a known candidate.
+
+With --json every progress and result object the service sends is printed as one
+line of JSON on stdout (JSON Lines) instead of the prose progress lines, and the
+process still exits 1 when the result object carries success:false.`,
+	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmdArgs := []string{"connect", args[0]}
 		if len(args) > 1 {
 			cmdArgs = append(cmdArgs, args[1])
+		}
+		if jsonOutput {
+			return sendCommandStreamingJSON("upstream", cmdArgs, nil)
 		}
 		return sendCommandStreaming("upstream", cmdArgs, nil)
 	},
@@ -737,6 +752,88 @@ func sendCommand(msg CLIMessage) (*CLIResponse, error) {
 	}
 
 	return &response, nil
+}
+
+// sendCommandStreamingJSON is the --json path of `upstream connect`.
+//
+// The service answers that command with a stream of progress objects followed
+// by one result object. --json prints every object it receives verbatim as a
+// single line of JSON (JSON Lines), so a parser can follow the progress and read
+// the outcome without the human-readable prose, and the exit status still
+// reports failure: `upstream connect` changes router state, so a success:false
+// result exits 1, and an unreachable service exits 1 with a JSON error object
+// on stdout (the #375 rule, see sendCommandStateChanging).
+func sendCommandStreamingJSON(command string, args []string, flags map[string]string) error {
+	msg := CLIMessage{
+		Command:   command,
+		Args:      args,
+		Flags:     flags,
+		Timestamp: time.Now(),
+	}
+
+	conn, err := net.Dial("unix", SocketPath)
+	if err != nil {
+		printJSONLine(&CLIResponse{
+			Success:   false,
+			Error:     fmt.Sprintf("Failed to communicate with TollGate service: %v", err),
+			Timestamp: time.Now(),
+		})
+		return fmt.Errorf("failed to communicate with TollGate service: %v", err)
+	}
+	defer conn.Close()
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to encode message: %v", err)
+	}
+
+	if _, err = conn.Write(data); err != nil {
+		return fmt.Errorf("failed to send message: %v", err)
+	}
+	if _, err = conn.Write([]byte("\n")); err != nil {
+		return fmt.Errorf("failed to send newline: %v", err)
+	}
+
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		var response CLIResponse
+		if err := json.Unmarshal(scanner.Bytes(), &response); err != nil {
+			continue
+		}
+
+		printJSONLine(&response)
+
+		if response.Progress != "" {
+			continue
+		}
+
+		if !response.Success {
+			if response.Error != "" {
+				return errors.New(response.Error)
+			}
+			return errors.New("command failed")
+		}
+		return nil
+	}
+
+	printJSONLine(&CLIResponse{
+		Success:   false,
+		Error:     "no response from service",
+		Timestamp: time.Now(),
+	})
+	return fmt.Errorf("no response from service")
+}
+
+// printJSONLine writes one compact JSON object per line (JSON Lines), which is
+// what a streaming command's --json output has to be: every progress object is
+// reported as it arrives instead of being buffered into one document.
+func printJSONLine(v interface{}) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(data))
+	return nil
 }
 
 func sendCommandStreaming(command string, args []string, flags map[string]string) error {

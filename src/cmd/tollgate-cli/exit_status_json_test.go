@@ -53,6 +53,7 @@ var stateChangingJSONCommands = []jsonCommandCase{
 	{"network private rename", []string{"network", "private", "rename", "NewSSID"}},
 	{"network private set-password", []string{"network", "private", "set-password", "correct-horse-battery"}},
 	{"upstream remove", []string{"upstream", "remove", "SomeSSID"}},
+	{"upstream connect", []string{"upstream", "connect", "SomeSSID", "some-passphrase"}},
 	{"config set", []string{"config", "set", "metric", "milliseconds"}},
 	{"config save", []string{"config", "save", `{"config_version":"v0.0.7"}`}},
 	{"config save-identities", []string{"config", "save-identities", `{"config_version":"v0.0.1"}`}},

@@ -561,20 +561,36 @@ In plain (non `--json`) mode the rules are the same except that a
 read-only failure also exits `1`, because there is no JSON payload to
 carry the error.
 
-### Commands without a --json form
-
-`ssl apply`, `ssl remove` and `ssl status` do not implement `--json`;
-they print human-readable text only, and `upstream connect` streams
-progress lines and also ignores `--json`. They exit non-zero when they
-fail. Their confirmation prompts are the exception: declining one still
-prints `Aborted.` and exits `0`. That gap is tracked separately and is
-not part of this exit-status audit.
-
 For `wallet drain cashu` specifically: a `success: false` response
 (including a partial drain) exits `1`, and any tokens that *were*
 produced are part of the JSON payload under `data.tokens` together with
 a `data.failures` list. Nothing is silently dropped. Note that `--json`
 writes no token file; use `--yes` when you want the file output.
+
+### ssl commands and `upstream connect`
+
+`ssl status`, `ssl apply` and `ssl remove` never talk to the TollGate
+socket: they read and write `/etc/tollgate/ssl` and the uhttpd /
+dnsmasq / nodogsplash configuration directly. They used to ignore
+`--json` completely; that gap is closed:
+
+| Command | `--json` payload | exit status |
+| --- | --- | --- |
+| `ssl status` | one object: `success`, `configured`, `mode`, `domain`, `cert`, `key`, `subject`, `issuer`, `not_before`, `not_after`, `days_remaining`, `expired`, `san` | always `0` — read-only; a certificate that cannot be read or parsed is reported as `success:false` with an `error` field |
+| `ssl apply`, `ssl remove` | one object: `success`, `action`, `mode`, `domain`, `cert`, `key`, `backup_dir`, `changed`, `cancelled`, `progress[]`, `error` | `0` applied/reverted, `1` attempted and failed, `2` the confirmation was declined (`cancelled:true`, `changed:false`, nothing was touched) |
+| `upstream connect` | one JSON object per line (JSON Lines): every progress object the service sends, then its result object | `0` connected, `1` on `success:false` or an unreachable service |
+
+For `ssl apply` / `ssl remove`, `progress` carries the same lines the
+human-readable mode prints, so nothing is lost by using `--json`.
+`changed` is `true` as soon as the run has modified router state, so a
+run that failed part-way reports `changed:true` together with
+`success:false`; read `error` (and the exit status) for the outcome.
+
+Interactive confirmations are a terminal interaction rather than
+output: under `--json` the prompt is written to **stderr**, so stdout
+stays parseable. For non-interactive use either pass `--yes` (`-y`) or
+redirect stdin from `/dev/null`, which declines the prompt and exits
+`2` — the same contract as a cancelled `wallet drain cashu`.
 
 ## Troubleshooting
 

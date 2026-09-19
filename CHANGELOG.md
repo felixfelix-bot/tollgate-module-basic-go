@@ -122,6 +122,24 @@ and [Semantic Versioning](https://semver.org/).
   JSON payload itself is unchanged in every case.
   ([#375](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/375))
 
+- **`ssl apply` / `ssl remove` / `ssl status` and `upstream connect` no longer
+  ignore `--json`.** The exit-status audit above found that the ssl subcommands
+  did not read the flag at all — `--json` printed the human-readable text and
+  was silently discarded — and that `upstream connect` streamed prose through
+  the same path. `ssl status --json` now reports the state (configured, mode,
+  domain, certificate subject/issuer/validity/days remaining, SAN) in one JSON
+  object and always exits `0`, as a read-only command should. `ssl apply` and
+  `ssl remove` report their outcome as one JSON object (`success`, `action`,
+  `changed`, `cancelled`, `progress[]`, `error`) and exit `1` when the apply or
+  revert failed. `upstream connect --json` prints every progress and result
+  object the service sends as a line of JSON (JSON Lines) and exits `1` on
+  `success:false`. Declining any of the five ssl confirmation prompts used to
+  print `Aborted.` and exit `0`; it now exits `2` like a cancelled
+  `wallet drain cashu`, so "nothing happened" is distinguishable from "the
+  action failed". Under `--json` the interactive prompt is written to stderr so
+  that stdout stays parseable. Human-readable output is unchanged.
+  ([#375](https://github.com/OpenTollGate/tollgate-module-basic-go/issues/375))
+
 - **Payment-goroutine panics no longer kill the process.** A panic
   inside the wallet layer during `PurchaseSession`'s `Receive` call
   (e.g. a mint returning malformed keysets) crashed the whole
