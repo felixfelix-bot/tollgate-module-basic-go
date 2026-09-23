@@ -724,7 +724,7 @@ type lightningInvoiceResponse struct {
 
 type balanceResponse struct {
 	Status        int    `json:"status"`
-	SessionActive bool   `json:"session_active"`
+	SessionActive bool   `json:"sessionActive"`
 	Metric        string `json:"metric,omitempty"`
 	Usage         uint64 `json:"usage"`
 	Allotment     uint64 `json:"allotment"`
