@@ -1,0 +1,64 @@
+TollGate e2e-test build — alpha5 (BOTH portal fixes) — provenance
+=================================================================
+
+ARTIFACT
+  portal-e2e/tollgate-wrt_0.6.0_alpha5_aarch64_cortex-a53_portalcu102ln004.apk
+  size   7863188 bytes
+  sha256 45e7d1760767789a0d0d16be2c61c9a0af542625469f4d401bd98a4e91dd9969
+
+WHAT IT FIXES (both portal fixes in the shipped bytes)
+  A  #CU102  keyset-agnostic v4 cashuB decode      (portal PR #55, d699367)
+  B  #LN004  client MAC on /ln-invoice create+poll   (portal PR #56, e67d646)
+             + the missing LN003_*/LN004_* i18n strings
+
+BUILD
+  module branch   pr/portal-pin-ln004 @ b975e22c  (PR #536)
+                  = upstream/main a99d983a + the portal repin + the guard + CHANGELOG
+  portal pin      e67d6469661ee530e1255bb788f86c341898910c (upstream portal main, #56)
+  bundle          regenerated with `bash packaging/portal-build.sh`
+                  node v22.17.0 / npm 10.9.2 (the pinned toolchain, no mismatch bypass)
+                  guest entry asset packaging/files/tollgate-captive-portal-site/
+                    assets/index-ldb-r6jB.js
+                    359545 bytes sha256 8540e1835b0fd4d8...
+  command         PATH=<go1.26.8>/bin SDK_TAG=mediatek-filogic-25.12.0 \
+                  PACKAGE_VERSION=v0.6.0-alpha5 \
+                  ARTIFACT_DIR=~/tollgate-artifacts/e2e-alpha5 \
+                  ./scripts/build-sdk-package.sh
+  toolchain       go1.26.8 (pinned), node v22.17.0 / npm 10.9.2 (pinned)
+  SDK image       openwrt/sdk:mediatek-filogic-25.12.0
+                  @sha256:29bec37ac2a85c2d52ab52e30ffb5499c139ec63be4e0bbd23ea6972ac473331
+                  (identical to the digest pinned in packaging/build-inputs.json)
+  apk metadata    version 0.6.0_alpha5-r0, depends jq libc nodogsplash (3),
+                  provides nodogsplash-files=0.6.0_alpha5-r0 + tollgate-wrt-any,
+                  no `replaces:` key
+
+WHY PACKAGE_VERSION=v0.6.0-alpha5 (explicit override; the repo VERSION file is
+NOT changed - the module PR #536 stays a pin fix)
+  Measured on apk-tools 3.0.2 (this SDK image and the OpenWrt 25.12 router):
+  `apk add <file.apk>` whose version EQUALS the installed one is a NO-OP and does
+  NOT rewrite the payload (dependency-free control package: install, tamper,
+  re-add the same file -> the tampered file survives, apk prints only
+  "OK: N B in M packages"). A 0.6.0_alpha4-r0 artifact could therefore install
+  "successfully" and leave the OLD portal bundle on the router.
+  `apk version -t 0.6.0_alpha5-r0 0.6.0_alpha4-r0` = ">"  -> a real upgrade.
+  `apk fix <file.apk>` is not a workaround: it rejects a file argument
+  ("Package '...' not found").
+  `apk del tollgate-wrt` is NOT a safe workaround either: measured dry run purges
+  tollgate-wrt AND jq AND libc AND nodogsplash (the daemon was pulled in as a
+  dependency), which would leave the portal unenforced.
+  The deploy script therefore also verifies router-side that the INSTALLED
+  bundle carries the #LN004 marker, and fails closed with a recovery recipe if it
+  does not, so a silent no-op cannot be mistaken for success.
+
+VERIFIED IN THE BYTES
+  payload scan (inflate the ADB deflate stream, grep):
+                                alpha5   alpha4(e2e, pin d699367)
+    mac=${encodeURIComponent(       1        0
+    "LN004_label"                   2        1
+    "LN003_label"                   2        1
+    getTokenMetadata                1        1
+  expected-assets-alpha5.txt lists all 26 web assets (portal + balance + admin)
+  found verbatim inside this apk, with path/size/sha256.
+
+NOT PUBLISHED ANYWHERE ELSE: no GitHub release, no tag, no feed, no Nostr event.
+This is a host-only scratch branch for the curl|bash hand test.
