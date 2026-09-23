@@ -332,7 +332,7 @@ echo "  nodogsplash running -> $(pgrep -c nodogsplash 2>/dev/null || echo 0)"
 echo "  admin SPA title     -> $(curl -s --max-time 5 http://127.0.0.1:8090/ 2>/dev/null | sed -n "s/.*<title>\(.*\)<\/title>.*/\1/p" | head -1)"'
 
 RECOVERY_TEXT=$(cat <<'RECOVERY'
-  VERDICT: FAIL - the installed portal bundle is not the one in this package.
+  ---- recovery (nothing was damaged) ----
   Most likely cause: apk treated the install as "already installed" (same
   version) and left the old payload. Nothing was damaged; recover with:
 
@@ -347,6 +347,60 @@ RECOVERY_TEXT=$(cat <<'RECOVERY'
   nodogsplash), which leaves the portal unenforced.
 RECOVERY
 )
+
+# ---------------------------------------------------------------- stages ---
+stage2_preflight() {
+  echo
+  echo "== 2/6  router inventory + pre-flight (one ssh; your password is asked here) =="
+  rsh "$STAGE2_REMOTE" > "$TMP/stage2.txt" 2>&1
+  RC2=$?
+  sed 's/^/    /' "$TMP/stage2.txt"
+  [ "$RC2" = "0" ] || echo "    (stage 2 exited $RC2 - see the ssh message above; continuing)"
+  UPLINK=$(sed -n 's/^TG_UPLINK=//p' "$TMP/stage2.txt" | tail -1)
+  if [ "$UPLINK" = "1" ]; then
+    echo "    uplink: PRESENT (the payment path can be exercised)"
+  else
+    cat <<'NOUPLINK'
+
+      !! WARNING: the router did not reach the internet (no ping / no DNS / no
+         tcp 443). This is NOT fatal for the install - the apk is local - but
+         WHAT IT MEANS FOR THE PAYMENT PATH: the router cannot reach the Cashu
+         mint to swap a token and cannot reach the LN backend to create an
+         invoice, so any e2e payment test right now will fail with network
+         errors ("context deadline exceeded" / token rejected) no matter how
+         good the portal bundle is. Restore the uplink before judging the fix.
+NOUPLINK
+  fi
+}
+
+stage4_install() {
+  echo
+  echo "== 4/6  install (the form the official installer uses) =="
+  rsh "apk add --allow-untrusted $REMOTE_APK
+  echo '    ---- installed version ----'
+  apk list --installed 2>/dev/null | grep -i tollgate
+  echo \"    setup marker: \$(cat /etc/tollgate-setup-done 2>/dev/null || echo none)\"" \
+    || die "INSTALL FAILED - see the router output above; nothing else was changed"
+}
+
+stage5_verify() {
+  echo
+  echo "== 5/6  the payload must actually be the new bundle (fail-closed) =="
+  rsh "$STAGE5_REMOTE" > "$TMP/v5.txt" 2>&1
+  V5=$?
+  sed 's/^/    /' "$TMP/v5.txt"
+  if [ "$V5" != "0" ]; then
+    echo
+    printf '%s\n' "$RECOVERY_TEXT"
+    die "payload verification failed (exit $V5) - router otherwise untouched (no reboot, no config wipe)"
+  fi
+}
+
+stage6_surface() {
+  echo
+  echo "== 6/6  read-only surface check (no reboot, no config wipe) =="
+  rsh "$STAGE6_REMOTE" | sed 's/^/    /'
+}
 
 # Test-harness hook: define everything above, run nothing below.
 # Sourced (BASH_SOURCE[0] != $0) -> return to the caller; executed -> exit 0.
@@ -394,52 +448,19 @@ if [ "$DRY" = "1" ]; then
 fi
 
 echo
-echo "== 2/6  router inventory + pre-flight (one ssh; your password is asked here) =="
-rsh "$STAGE2_REMOTE" > "$TMP/stage2.txt" 2>&1
-RC2=$?
-sed 's/^/    /' "$TMP/stage2.txt"
-[ "$RC2" = "0" ] || echo "    (stage 2 exited $RC2 - see the ssh message above; continuing)"
-UPLINK=$(sed -n 's/^TG_UPLINK=//p' "$TMP/stage2.txt" | tail -1)
-if [ "$UPLINK" = "1" ]; then
-  echo "    uplink: PRESENT (the payment path can be exercised)"
-else
-  cat <<'NOUPLINK'
-
-    !! WARNING: the router did not reach the internet (no ping / no DNS / no
-       tcp 443). This is NOT fatal for the install - the apk is local - but
-       WHAT IT MEANS FOR THE PAYMENT PATH: the router cannot reach the Cashu
-       mint to swap a token and cannot reach the LN backend to create an
-       invoice, so any e2e payment test right now will fail with network
-       errors ("context deadline exceeded" / token rejected) no matter how
-       good the portal bundle is. Restore the uplink before judging the fix.
-NOUPLINK
-fi
+stage2_preflight
 
 echo
 stage3_transfer
 
 echo
-echo "== 4/6  install (the form the official installer uses) =="
-rsh "apk add --allow-untrusted $REMOTE_APK
-echo '    ---- installed version ----'
-apk list --installed 2>/dev/null | grep -i tollgate
-echo \"    setup marker: \$(cat /etc/tollgate-setup-done 2>/dev/null || echo none)\"" \
-  || die "INSTALL FAILED - see the router output above; nothing else was changed"
+stage4_install
 
 echo
-echo "== 5/6  the payload must actually be the new bundle (fail-closed) =="
-rsh "$STAGE5_REMOTE" > "$TMP/v5.txt" 2>&1
-V5=$?
-sed 's/^/    /' "$TMP/v5.txt"
-if [ "$V5" != "0" ]; then
-  echo
-  printf '%s\n' "$RECOVERY_TEXT"
-  die "payload verification failed (exit $V5) - router otherwise untouched (no reboot, no config wipe)"
-fi
+stage5_verify
 
 echo
-echo "== 6/6  read-only surface check (no reboot, no config wipe) =="
-rsh "$STAGE6_REMOTE" | sed 's/^/    /'
+stage6_surface
 
 cat <<'NEXT'
 
