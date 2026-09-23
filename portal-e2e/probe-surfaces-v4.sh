@@ -383,7 +383,8 @@ fingerprint_page "admin   :$ADMIN_PORT" "http://$R:$ADMIN_PORT/" \
 echo " assets checked: $TOTAL  (matches alpha5=$MATCH5 [of which alpha5-only=$M5_DISTINCT] matches alpha4=$MATCH4 differs=$DIFF absent-from-both=$ABSENT unreadable=$UNREAD)"
 if [ "$TOTAL" -eq 0 ]; then
   echo " verdict: unknown (no assets readable)"
-elif [ "$MATCH5" -eq 0 ] && [ "$MATCH4" -eq 0 ]; then
+elif [ "$MATCH5" -eq 0 ] && [ "$MATCH4" -eq 0 ] && [ "$DIFF" -eq 0 ] && [ "$ABSENT" -eq 0 ]; then
+  # nothing could be fingerprinted and the ONLY reason is that the fetches failed
   echo " verdict: unknown (no referenced asset could be fingerprinted - $UNREAD unreadable)"
 elif [ "$DIFF" -eq 0 ] && [ "$ABSENT" -eq 0 ] && [ "$MATCH4" -eq 0 ] \
      && [ "$MATCH5" -gt 0 ] && [ "$M5_DISTINCT" -gt 0 ]; then
