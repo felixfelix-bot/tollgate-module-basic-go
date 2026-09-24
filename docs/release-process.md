@@ -93,6 +93,12 @@ suffix first.
 
 ### 1. Pre-flight gates
 
+**Which lanes the gate is made of, and what proves each one, is stated in one
+place: [`RELEASE-GATE.md`](../RELEASE-GATE.md).** That file is the contract for
+"may I prepare the feed bump?"; the commands below are the local halves of it,
+and [`REGRESSION.md`](../REGRESSION.md) is the full lane inventory (including
+what nothing automates).
+
 From `src/` (each standalone module too), on the commit to be tagged:
 
 ```bash
