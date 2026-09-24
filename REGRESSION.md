@@ -81,6 +81,19 @@ It is not a substitute for hardware: no kernel, no nftables/fw4, no conntrack,
 no real `ndsctl`, no Wi-Fi, no DHCP/ARP. Those stay with
 `physical-router-test-automation` and the hardware harness below.
 
+### Toolchains: the lane runs on the host it is on
+
+`tests/happy-path/stage-artifact.sh` stages with whatever Go, node and npm the
+host has, printing a `NOTE:` when either differs from the pin in
+`packaging/build-inputs.json` (measured 2026-09-24 on this fleet: host node
+`v22.22.1` / npm `9.2.0` against the manifest's `22.17.0` / `10.9.2`). That is
+deliberate — this lane checks behaviour, and byte-identity belongs to the repro
+lane — but it means a green run here says nothing about the shipped bytes. The
+ngit CI job resolves both toolchains from the manifest, so a CI green is a
+pinned-toolchain green, while a local green is a behaviour green on the host's
+toolchain. `packaging/`'s own guard is untouched: a packaging or release build
+still refuses a mismatched toolchain.
+
 ### Reading a result
 
 * **ngit CI** publishes signed results to Nostr — there is no web URL. Read them

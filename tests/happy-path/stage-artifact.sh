@@ -106,9 +106,30 @@ else
     PORTAL_SRC="${TG_PORTAL_SRC:-/var/tmp/tollgate-portal-src}"
     echo "--- guest SPA (etc/tollgate/tollgate-captive-portal-site) from the pinned portal commit ---"
     echo "    portal source: $PORTAL_SRC"
-    OUTPUT_DIR="$OUT/etc/tollgate/tollgate-captive-portal-site" \
-    ADMIN_OUTPUT_DIR="$OUT/www/tollgate" \
-    PORTAL_DIR="$PORTAL_SRC" \
+
+    # portal-build.sh's node/npm guard protects byte-identity, and its default
+    # stays strict: nothing here relaxes it for packaging lanes or the release
+    # build. This is the behaviour lane (same reasoning as the Go note above),
+    # and the pinned node/npm are usually absent from a dev or release host —
+    # measured 2026-09-24 on this fleet, where the host carries node v22.22.1 /
+    # npm 9.2.0 against the manifest's 22.17.0 / 10.9.2, so the one command
+    # REGRESSION.md documents died in staging before the suite ran. Tolerate it
+    # loudly, and record which toolchain produced the bundle so that a green run
+    # is attributable.
+    ACTIVE_NODE="$(node --version 2>/dev/null || echo none)"
+    ACTIVE_NPM="$(npm --version 2>/dev/null || echo none)"
+    NODE_ENV_ARGS=()
+    if [ "$ACTIVE_NODE" != "v$NODE_VERSION" ] || [ "$ACTIVE_NPM" != "$NPM_VERSION" ]; then
+        echo "NOTE: node $ACTIVE_NODE / npm $ACTIVE_NPM != pinned v$NODE_VERSION / $NPM_VERSION" >&2
+        echo "      (packaging/build-inputs.json); this lane tests behaviour, so it proceeds —" >&2
+        echo "      the repro lane is the byte gate." >&2
+        NODE_ENV_ARGS=(TG_ALLOW_NODE_MISMATCH=1)
+    fi
+
+    env ${NODE_ENV_ARGS[@]+"${NODE_ENV_ARGS[@]}"} \
+        OUTPUT_DIR="$OUT/etc/tollgate/tollgate-captive-portal-site" \
+        ADMIN_OUTPUT_DIR="$OUT/www/tollgate" \
+        PORTAL_DIR="$PORTAL_SRC" \
         bash packaging/portal-build.sh || exit 1
 fi
 
