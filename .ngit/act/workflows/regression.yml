@@ -1,0 +1,178 @@
+name: Regression lanes
+
+# Nostr CI (ngit-ci) workflow. See .ngit/README.md for the authorization
+# policy, how to read results, and the checks deliberately not run here.
+#
+# WHY THIS FILE EXISTS
+#
+# Until now nothing executed the customer happy path on a commit:
+#
+#   * `.github/workflows/` is dead org-wide (no GitHub Actions run since
+#     2026-07-28 on the OpenTollGate org), and the happy-path gate that was
+#     written for it (build-package.yml's happy-path job) therefore runs
+#     nowhere;
+#   * `tests/happy-path/run.sh` — the published-artifact happy-path suite with
+#     the real module binary, the offline stub mint, the fake-`ndsctl` seam and
+#     the guest SPA in a real browser — had no caller in any CI system;
+#   * `tests/cloud-lab/` (real cdk-mintd mint + the module binary in containers)
+#     had none either.
+#
+# This file is that caller. It runs the SAME entry point a human runs locally:
+#
+#   bash scripts/regression-lane.sh --lane module      # artifact + real browser
+#   bash scripts/regression-lane.sh --lane cloud-lab   # docker compose lab
+#   make regression                                    # both, in one command
+#
+# so there is one definition of each lane and no lane-local command list to go
+# stale. REGRESSION.md at the repository root is the inventory (what runs where,
+# what each lane covers, and what NOTHING automates); RELEASE-GATE.md states
+# which lanes must be green before a feed bump.
+#
+# WHAT THE MODULE LANE NEEDS, AND WHY IT CAN RUN HERE
+#
+# The suite asserts on the bytes a user installs, and there is no published
+# package for the commit under test — so the lane builds one:
+# tests/happy-path/stage-artifact.sh stages the same payload paths the
+# .ipk/.apk carry (module binary + the bundle from the pinned portal commit in
+# packaging/build-inputs.json), using the repository's own builders. No docker,
+# no secret, no real mint and no real ecash are involved; the mint is a local
+# Python stub and the payment is never settled.
+#
+# The ngit port keeps the house rules: literal action pins, the pinned
+# toolchains resolved from packaging/build-inputs.json (never a lane-local
+# literal), defensive jq, no `services:`/`container:` (act refuses them on this
+# deployment), no repository token, and a 30-minute job cap — the coordinator's
+# default, so asking for more would buy nothing.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  happy-path:
+    name: "Happy path (built artifact, real browser)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Git metadata is not always readable from inside a CI job container, which
+      # turns `go build` into a hard error while stamping VCS info. This lane is
+      # about behaviour, not version metadata.
+      GOFLAGS: -buildvcs=false
+      # Artifact, work dir and evidence all live outside /tmp: that is a small
+      # tmpfs on the hosts this fleet runs, and a staged portal tree does not fit.
+      HP_TMPDIR: /var/tmp
+      HP_PYTHON: python3
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Ensure jq is present
+        # packaging/build-env.sh reads the pinned inputs with jq and refuses to
+        # run without it. GitHub runners ship jq; the act images are leaner.
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq missing; installing it"
+            SUDO=""
+            command -v sudo >/dev/null 2>&1 && SUDO=sudo
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y -qq jq
+          fi
+          jq --version
+
+      # Both toolchains come from the manifest, so no lane-local literal can
+      # drift from the pins the shipped artifact is built with. A version
+      # resolved to a plain string takes the shorter, better-tested path through
+      # the actions (`go-version-file` resolution is what failed in this
+      # deployment's act image on the first run — see .ngit/README.md).
+      - name: Resolve the pinned Go and Node from the manifest
+        id: pins
+        run: |
+          set -euo pipefail
+          : ${GITHUB_OUTPUT:=/tmp/github_output}
+          echo "go=$(jq -r '.go.version' packaging/build-inputs.json)"   >> "$GITHUB_OUTPUT"
+          echo "node=$(jq -r '.node.version' packaging/build-inputs.json)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.pins.outputs.go }}
+          cache: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ steps.pins.outputs.node }}
+
+      - name: Report the toolchains in use
+        run: |
+          go version
+          node --version
+          npm --version
+          # packaging/portal-build.sh refuses a node/npm that is not the pinned
+          # pair, so print the pins next to what is installed.
+          jq -r '"pinned: go " + .go.version + ", node " + .node.version + ", npm " + .npm.version' packaging/build-inputs.json
+
+      - name: Install Playwright chromium (for the portal checks)
+        # The guest SPA is driven in a real browser against the live module; the
+        # module-only checks would pass without this, which is exactly the kind
+        # of half-green lane this file exists to avoid.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --break-system-packages playwright
+          export PATH="$HOME/.local/bin:$PATH"
+          python3 -m playwright install --with-deps chromium
+
+      - name: Run the module regression lane
+        # The one command a human runs locally. It stages the artifact, runs
+        # tests/happy-path/run.sh against it, and prints
+        #   LANE module PASS|FAIL <HPRESULT …>
+        # A FAIL is a real failure: the suite fails closed, so a green run here
+        # means every check in it actually ran.
+        run: bash scripts/regression-lane.sh --lane module --out /var/tmp/tp-evidence
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "----- lane results -----"
+          grep -hE '^LANE |^LANES |^HPRESULT |^HPEXIT ' /var/tmp/tp-evidence/*.log 2>/dev/null || echo "(no lane log found)"
+          echo "----- failing checks, if any -----"
+          grep -hE '^HPCHECK .* FAIL' /var/tmp/tp-evidence/happy-path.log 2>/dev/null || echo "(none)"
+
+  cloud-lab:
+    name: "Cloud lab (docker compose: real mint, real binary)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Report the container capabilities available to this job
+        # `act` jobs are not guaranteed a container daemon; this deployment
+        # mounts one (the release shards run `docker run openwrt/sdk` from plain
+        # jobs), but the compose plugin is a separate question. Printing both
+        # makes a SKIP attributable instead of mysterious.
+        run: |
+          set -uo pipefail
+          docker --version 2>&1 || echo "docker MISSING"
+          docker info --format '{{.ServerVersion}}' 2>&1 || echo "docker daemon UNREACHABLE"
+          docker compose version 2>&1 || echo "docker compose MISSING"
+
+      - name: Run the cloud-lab regression lane
+        # tests/cloud-lab/docker-compose.yml: cdk-mintd (FakeWallet) + the real
+        # module binary in a container with the fake-ndsctl seam + a python
+        # client. The lane SKIPs (loudly, with the reason) when this job has no
+        # usable docker+compose, and FAILs when it has them and the lab fails.
+        run: bash scripts/regression-lane.sh --lane cloud-lab --out /var/tmp/tp-evidence-cloud
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "----- lane results -----"
+          grep -hE '^LANE |^LANES ' /var/tmp/tp-evidence-cloud/*.log 2>/dev/null || true
+          # The wrapper tees the lane's own logs; show the tail of the failing
+          # one so the job log alone is enough to see what happened.
+          for f in /var/tmp/tp-evidence-cloud/cloud-lab-up.log /var/tmp/tp-evidence-cloud/cloud-lab-tests.log; do
+            [ -f "$f" ] || continue
+            echo "----- tail $(basename "$f") -----"
+            tail -30 "$f"
+          done
