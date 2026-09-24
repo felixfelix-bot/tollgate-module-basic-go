@@ -105,6 +105,7 @@ LEASE_FIXTURE="$WORK/dhcp.leases"
 LEASE_BEFORE="$WORK/dhcp.leases.pre-suite"
 LEASE_CREATED=0      # 1 = the path did not exist and this suite created it
 LEASE_HAD_FILE=0     # 1 = a file was there; its content is in $LEASE_BEFORE
+LEASE_SNAPSHOT=0     # 1 = $LEASE_BEFORE holds the content as found (see C5b)
 
 TOTAL=0; PASSED=0; FAILED_N=0; SKIPPED=0
 FAILED_IDS=""
@@ -453,21 +454,47 @@ if [ "$MOD_UP" = "1" ]; then
         *)       chk api:whoami FAIL "/whoami -> HTTP $CODE body: $(printf '%s' "$W" | head -c 160)" ;;
     esac
 
-    # --- C5b: negative control — a client with no lease is not keyed -------
-    # 127.0.0.3 appears in no fixture lease and in no ARP table, so this is the
-    # control that the lease seeded in 1b is what makes C5 pass, not something
-    # else on the host. It also keeps the unresolved state observable: an
-    # identity-less caller is echoed an EMPTY mac (/whoami is an echo; the
-    # payment path is where the module refuses with 400 device-unresolved).
-    NC="$(curl -s -m 25 -o "$WORK/nc-body" -w '%{http_code}' \
-            "http://127.0.0.3:$MODULE_PORT/whoami" 2>/dev/null)"
-    NCB="$(cat "$WORK/nc-body" 2>/dev/null)"
-    if [ "$NC" != "200" ]; then
-        chk api:whoami-unresolved-client-not-keyed FAIL "the unleased client 127.0.0.3 got no answer (HTTP $NC) — the control cannot be read"
-    elif printf '%s' "$NCB" | grep -qE 'mac=[0-9a-fA-F]{2}:'; then
-        chk api:whoami-unresolved-client-not-keyed FAIL "an unleased client (127.0.0.3) was keyed: HTTP $NC body: $(printf '%s' "$NCB" | head -c 80)"
+    # --- C5b: negative control — withdraw the identity source, and the payment
+    # path must REFUSE rather than invent an identity or key a shared one ------
+    # This is exactly the state the CI lane hit when the suite had no lease of
+    # its own (api:whoami an empty mac, POST /ln-invoice 400 device-unresolved),
+    # and it is what proves the lease seeded in 1b is load-bearing. Note WHY the
+    # control withdraws the file instead of probing from an unleased address:
+    # measured 2026-09-24, a request from 127.0.0.3 is answered with the
+    # 127.0.0.1 identity (the module resolves loopback sources to that lease
+    # entry), so off-router there is no second "unleased client" to probe with —
+    # the observable variable is the identity SOURCE, not the source address.
+    # The fixture is put back immediately, so the later checks are unaffected.
+    if [ "$RUN_MODE" = "container" ]; then
+        chk api:money-path-refuses-unresolved-client SKIP \
+            "the module runs in a container with the lease bound read-only: the identity source cannot be withdrawn mid-run (the refusal path is covered by src/identity_sentinel_test.go)"
     else
-        chk api:whoami-unresolved-client-not-keyed PASS "an unleased client (127.0.0.3) is not keyed: HTTP $NC $(printf '%s' "$NCB" | head -c 60)"
+        # Snapshot the CURRENT content first (the host's, or the host's plus our
+        # lines), then write an empty file: no lease entry for 127.0.0.1 and no
+        # ARP entry for it either, so the module cannot resolve the caller.
+        if [ "$LEASE_SNAPSHOT" != "1" ]; then
+            cat "$LEASE_PATH" > "$LEASE_BEFORE" 2>/dev/null && LEASE_SNAPSHOT=1 && LEASE_HAD_FILE=1
+        fi
+        : > "$LEASE_PATH"
+        RMAC="$(curl -s -m 25 -o "$WORK/nc-body" -w '%{http_code}' \
+                "http://127.0.0.1:$MODULE_PORT/ln-invoice" \
+                -X POST -H 'Content-Type: application/json' \
+                --data-binary '{"amount":210,"mint_url":"http://127.0.0.1:1/","mac":"02:00:00:00:00:20"}' \
+                2>/dev/null)"
+        RMB="$(cat "$WORK/nc-body" 2>/dev/null)"
+        # put the identity source back BEFORE any other check runs
+        if [ "$LEASE_SNAPSHOT" = "1" ]; then
+            cat "$LEASE_BEFORE" > "$LEASE_PATH" 2>/dev/null
+        else
+            cat "$LEASE_FIXTURE" > "$LEASE_PATH" 2>/dev/null
+        fi
+        if [ "$RMAC" = "400" ] && printf '%s' "$RMB" | grep -q 'device-unresolved'; then
+            chk api:money-path-refuses-unresolved-client PASS "with the identity source withdrawn, POST /ln-invoice -> HTTP 400 device-unresolved (the real CI state, reproduced in-run); source restored"
+        elif printf '%s' "$RMB" | grep -q '"access_granted":true'; then
+            chk api:money-path-refuses-unresolved-client FAIL "with NO identity source, POST /ln-invoice still granted access: HTTP $RMAC $(printf '%s' "$RMB" | head -c 120)"
+        else
+            chk api:money-path-refuses-unresolved-client FAIL "with the identity source withdrawn, POST /ln-invoice -> HTTP $RMAC $(printf '%s' "$RMB" | head -c 140) (want 400 + device-unresolved)"
+        fi
     fi
 
     # --- C6: /balance ------------------------------------------------------
