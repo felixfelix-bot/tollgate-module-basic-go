@@ -1,6 +1,7 @@
 package merchant
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
@@ -16,9 +17,14 @@ const (
 	probeInterval                  = 5 * time.Minute
 
 	// Aggressive retry: when no mints are reachable at startup (e.g. WiFi STA
-	// not yet connected), probe every 15s with immediate recovery (threshold=1)
-	// for up to 5 minutes. This complements the OpenWrt hotplug script that
-	// restarts tollgate when the wwan interface comes up.
+	// not yet connected) OR after a runtime downgrade to degraded mode, probe
+	// every 15s with immediate recovery (threshold=1) for up to 5 minutes.
+	// This complements the OpenWrt hotplug script that restarts tollgate when
+	// the wwan interface comes up, and keeps a transient mint blip from
+	// stranding the service in degraded mode for a whole proactive cycle
+	// (~13 min observed in the field, #429). The live values live on the
+	// tracker struct (per-instance, settable before any loop starts) so tests
+	// can shorten them without package-level mutable state.
 	aggressiveProbeInterval = 15 * time.Second
 	aggressiveProbeTimeout  = 10 * time.Second
 	aggressiveDuration      = 5 * time.Minute
@@ -40,6 +46,10 @@ type MintHealthTracker struct {
 	onReachableSetChanged func()
 	reachableCount        int
 	stopCh                chan struct{}
+	aggressiveArmed       bool
+	aggressiveInterval    time.Duration
+	aggressiveTimeout     time.Duration
+	aggressiveWindow      time.Duration
 }
 
 func NewMintHealthTracker(configProvider mintConfigProvider) *MintHealthTracker {
@@ -51,6 +61,10 @@ func NewMintHealthTracker(configProvider mintConfigProvider) *MintHealthTracker 
 		},
 		configProvider:    configProvider,
 		recoveryThreshold: defaultRecoveryThreshold,
+
+		aggressiveInterval: aggressiveProbeInterval,
+		aggressiveTimeout:  aggressiveProbeTimeout,
+		aggressiveWindow:   aggressiveDuration,
 	}
 }
 
@@ -66,14 +80,9 @@ func (t *MintHealthTracker) StartProactiveChecks() {
 	t.mu.Unlock()
 
 	go func() {
-		var aggressiveDone chan struct{}
 		if needAggressive {
-			log.Printf("StartProactiveChecks: starting aggressive retry (no reachable mints at startup)")
-			aggressiveDone = t.runAggressiveRetry(stopCh)
-			go func() {
-				<-aggressiveDone
-				log.Printf("StartProactiveChecks: aggressive retry completed")
-			}()
+			log.Printf("StartProactiveChecks: no reachable mints at startup — arming aggressive retry")
+			t.ArmAggressiveRetry()
 		}
 
 		ticker := time.NewTicker(probeInterval)
@@ -90,14 +99,46 @@ func (t *MintHealthTracker) StartProactiveChecks() {
 	}()
 }
 
+// ArmAggressiveRetry starts the aggressive (15 s) probe loop on a tracker
+// that is already running proactive checks. Armed on the runtime downgrade
+// path (#429): without it, recovery from a transient mint blip waits for
+// the next 5-minute proactive cycle — a ~13-minute stuck-degraded window
+// was observed live. On success the aggressive check fires the same
+// first-reachable and set-changed callbacks as the proactive check, so a
+// wired recovery trigger (see MerchantDegraded.WireRecoveryTrigger) fires
+// within seconds. Idempotent: a second call while armed is a no-op.
+func (t *MintHealthTracker) ArmAggressiveRetry() {
+	t.mu.Lock()
+	if t.stopCh == nil {
+		t.mu.Unlock()
+		log.Printf("ArmAggressiveRetry: proactive checks not running — nothing to arm")
+		return
+	}
+	if t.aggressiveArmed {
+		t.mu.Unlock()
+		return
+	}
+	t.aggressiveArmed = true
+	stopCh := t.stopCh
+	t.mu.Unlock()
+
+	done := t.runAggressiveRetry(stopCh)
+	go func() {
+		<-done
+		t.mu.Lock()
+		t.aggressiveArmed = false
+		t.mu.Unlock()
+	}()
+}
+
 func (t *MintHealthTracker) runAggressiveRetry(stopCh chan struct{}) chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		aggressiveClient := &http.Client{Timeout: aggressiveProbeTimeout}
-		ticker := time.NewTicker(aggressiveProbeInterval)
+		aggressiveClient := &http.Client{Timeout: t.aggressiveTimeout}
+		ticker := time.NewTicker(t.aggressiveInterval)
 		defer ticker.Stop()
-		timer := time.NewTimer(aggressiveDuration)
+		timer := time.NewTimer(t.aggressiveWindow)
 		defer timer.Stop()
 
 		for {
@@ -108,7 +149,7 @@ func (t *MintHealthTracker) runAggressiveRetry(stopCh chan struct{}) chan struct
 					return
 				}
 			case <-timer.C:
-				log.Printf("runAggressiveRetry: aggressive period ended (%v), falling back to normal interval", aggressiveDuration)
+				log.Printf("runAggressiveRetry: aggressive period ended (%v), falling back to normal interval", t.aggressiveWindow)
 				return
 			case <-stopCh:
 				return
@@ -161,13 +202,29 @@ func (t *MintHealthTracker) GetAllConfiguredMintConfigs() []config_manager.MintC
 
 func (t *MintHealthTracker) MarkUnreachable(mintURL string) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 
-	if t.reachableMints[mintURL] {
+	// A previously-reachable mint going down changes the reachable set: the
+	// callback must fire here (#401), or the probe path's setChanged
+	// comparison later runs against this already-updated count and the
+	// degraded-mode transition is silently suppressed for the rest of the
+	// outage whenever a payment observed it first.
+	fireSetChanged := t.reachableMints[mintURL]
+	if fireSetChanged {
 		t.reachableCount--
 	}
 	t.reachableMints[mintURL] = false
 	t.consecutiveSuccesses[mintURL] = 0
+
+	var callback func()
+	if fireSetChanged && t.onReachableSetChanged != nil {
+		callback = t.onReachableSetChanged
+	}
+	t.mu.Unlock()
+
+	if callback != nil {
+		log.Printf("MarkUnreachable: reachable set changed (mint=%s), firing callback", mintURL)
+		go callback()
+	}
 }
 
 // SetOnFirstReachableForDegraded registers a callback that fires once when a mint
@@ -356,8 +413,18 @@ func (t *MintHealthTracker) probeMint(mintURL string) bool {
 	return t.probeMintWith(mintURL, t.httpClient)
 }
 
+// keysetsProbeResponse is the subset of the NUT-01 GET /v1/keysets response
+// the health probe validates.
+type keysetsProbeResponse struct {
+	Keysets []json.RawMessage `json:"keysets"`
+}
+
 func (t *MintHealthTracker) probeMintWith(mintURL string, client *http.Client) bool {
-	url := strings.TrimRight(mintURL, "/") + "/v1/info"
+	// Probe /v1/keysets, not /v1/info: a mint is only usable for payments if it
+	// serves its active keysets, and some fronts answer /v1/info with a 2xx HTML
+	// page (parked/hosted error pages), which a status-only check wrongly treats
+	// as healthy — leading to advertised mints whose token swaps then fail.
+	url := strings.TrimRight(mintURL, "/") + "/v1/keysets"
 
 	start := time.Now()
 	resp, err := client.Get(url)
@@ -368,7 +435,17 @@ func (t *MintHealthTracker) probeMintWith(mintURL string, client *http.Client) b
 	}
 	defer resp.Body.Close()
 
-	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
-	log.Printf("mint probe: url=%s status=%d elapsed=%s ok=%v", url, resp.StatusCode, elapsed, ok)
-	return ok
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("mint probe: url=%s status=%d elapsed=%s ok=false", url, resp.StatusCode, elapsed)
+		return false
+	}
+
+	var body keysetsProbeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || len(body.Keysets) == 0 {
+		log.Printf("mint probe: url=%s status=%d elapsed=%s ok=false reason=invalid-or-empty-keysets err=%v", url, resp.StatusCode, elapsed, err)
+		return false
+	}
+
+	log.Printf("mint probe: url=%s status=%d keysets=%d elapsed=%s ok=true", url, resp.StatusCode, len(body.Keysets), elapsed)
+	return true
 }

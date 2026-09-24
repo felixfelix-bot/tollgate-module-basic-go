@@ -67,6 +67,35 @@ func (m *MerchantDegraded) OnUpgrade(callback func(MerchantInterface)) {
 	m.onUpgrade = callback
 }
 
+// WireRecoveryTrigger registers the tracker's first-reachable callback so a
+// runtime downgrade (the full -> degraded transition in main) can upgrade
+// back once a mint recovers. The startup degraded paths register the same
+// sequence inline; without this, a runtime downgrade wires the onUpgrade
+// consumer but nothing ever fires it (#400) and the service stays degraded
+// until manually restarted.
+func (m *MerchantDegraded) WireRecoveryTrigger() {
+	m.mintHealthTracker.SetOnFirstReachableForDegraded(func() {
+		m.AttemptUpgrade()
+	})
+}
+
+// AttemptUpgrade shuts down the degraded wallet, rebuilds a full merchant on
+// the tracker's current reachable set, and fires onUpgrade with it.
+func (m *MerchantDegraded) AttemptUpgrade() {
+	log.Printf("Mint became reachable — attempting upgrade from degraded mode")
+	if err := m.Shutdown(); err != nil {
+		log.Printf("ERROR: Failed to shutdown degraded wallet before upgrade: %v", err)
+	}
+	fullMerchant, err := newFullMerchant(m.configManager, m.mintHealthTracker)
+	if err != nil {
+		log.Printf("ERROR: Failed to upgrade from degraded mode: %v", err)
+		return
+	}
+	if m.onUpgrade != nil {
+		m.onUpgrade(fullMerchant)
+	}
+}
+
 func NewMerchantDegradedFromFull(configManager *config_manager.ConfigManager, tracker *MintHealthTracker) *MerchantDegraded {
 	walletDirPath := filepath.Dir(configManager.ConfigFilePath)
 	return NewMerchantDegradedWithWallet(configManager, tracker, DefaultWalletFactory, walletDirPath)
@@ -178,6 +207,12 @@ func (m *MerchantDegraded) CreateNoticeEvent(level, code, message, customerPubke
 
 func (m *MerchantDegraded) GetSession(macAddress string) (*CustomerSession, error) {
 	return nil, fmt.Errorf("wallet not initialized: no reachable mints")
+}
+
+// GetSessionState answers "none" in degraded mode: without a wallet no session
+// can exist, which is the same answer GetUsage gives ("-1/-1").
+func (m *MerchantDegraded) GetSessionState(macAddress string) (SessionState, error) {
+	return SessionStateNone, nil
 }
 
 func (m *MerchantDegraded) AddAllotment(macAddress, metric string, amount uint64) (*CustomerSession, error) {
