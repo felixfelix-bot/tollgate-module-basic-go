@@ -182,7 +182,19 @@ run_cloud_lab_lane() {
         sleep 2
     done
     if [ "$up" != "1" ]; then
-        "${compose[@]}" ps > "$EVIDENCE/cloud-lab-ps.log" 2>&1
+        # Say WHY, in the job log and in the evidence dir: `ps` shows a container
+        # that exited (and its exit code) while `logs` shows the module refusing
+        # to boot. Without this the first real CI run reported only "did not
+        # answer within 120s" and the reason died with the act container.
+        {
+            echo "=== compose ps ==="
+            "${compose[@]}" ps -a
+            for svc in mint upstream; do
+                echo "=== docker logs --tail 60 $svc ==="
+                "${compose[@]}" logs --no-color --tail 60 "$svc" 2>&1
+            done
+        } > "$EVIDENCE/cloud-lab-ps.log" 2>&1 || true
+        tail -40 "$EVIDENCE/cloud-lab-ps.log" 2>/dev/null || true
         lane cloud-lab FAIL "mint/upstream did not answer on :8085/:2121 within 120s (log: $EVIDENCE/cloud-lab-ps.log)"
         [ "$KEEP" = "1" ] || "${compose[@]}" down -v >/dev/null 2>&1
         cd "$REPO_ROOT"; return
