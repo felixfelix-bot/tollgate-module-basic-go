@@ -404,11 +404,49 @@ jobs:
           echo "portal_sha=$PORTAL_SHA" >> "$GITHUB_OUTPUT"
           echo "Captive portal built from commit \`$PORTAL_SHA\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload portal assets
+      # Ship the WHOLE generated bundle, not just the guest SPA. The SDK recipe
+      # behind package-apk (packaging/Makefile) also installs the admin board
+      # (files/tollgate-admin), the rpcd plugin + its ACL
+      # (files/usr/libexec/rpcd/tollgate, files/usr/share/rpcd/acl.d/tollgate.json)
+      # and the generated files/etc/uci-defaults/92-tollgate-admin-setup - all
+      # build products of packaging/portal-build.sh, all gitignored, none of
+      # them in the checkout. Uploading only packaging/files/tollgate-captive-portal-site
+      # left package-apk failing at `make package/tollgate-wrt/compile` with
+      #   install: cannot stat '.../files/etc/uci-defaults/92-tollgate-admin-setup'
+      # (measured 2026-09-24, fork run 35942922838). See
+      # docs/architecture/captive-portal-bundle-location-decision.md (Option B:
+      # build in CI, ship the artifact).
+      - name: Stage the built portal bundle
+        run: |
+          set -euo pipefail
+          # Stage under an explicit root rather than leaning on how
+          # upload-artifact resolves multiple paths: portal-bundle/ mirrors the
+          # packaging/files/-relative layout, so each consumer below unpacks it
+          # straight back into its own packaging/files/.
+          rm -rf portal-bundle
+          mkdir -p portal-bundle
+          for p in \
+            tollgate-captive-portal-site \
+            tollgate-admin \
+            usr/libexec/rpcd/tollgate \
+            usr/share/rpcd/acl.d/tollgate.json \
+            etc/uci-defaults/92-tollgate-admin-setup ; do
+            test -e "packaging/files/$p" || {
+              echo "ERROR: packaging/portal-build.sh did not emit packaging/files/$p" >&2
+              exit 1
+            }
+            mkdir -p "portal-bundle/$(dirname "$p")"
+            cp -a "packaging/files/$p" "portal-bundle/$p"
+          done
+          echo "Staged $(find portal-bundle -type f | wc -l) bundle file(s):"
+          find portal-bundle -type f | sort | sed 's|^portal-bundle/|  |'
+
+      - name: Upload the built portal bundle
         uses: actions/upload-artifact@v4
         with:
           name: portal-assets
-          path: packaging/files/tollgate-captive-portal-site/
+          path: portal-bundle/
+          if-no-files-found: error
           retention-days: 7
 
   package-ipk:
@@ -465,7 +503,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: portal-assets
-          path: packaging/files/tollgate-captive-portal-site/
+          # The artifact is rooted at packaging/files/ now (it carries the whole
+          # generated bundle), so unpack it there rather than into the SPA dir.
+          path: packaging/files/
 
       - name: Build .ipk
         run: |
@@ -703,7 +743,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: portal-assets
-          path: src-checkout/packaging/files/tollgate-captive-portal-site/
+          # The artifact is rooted at packaging/files/ now (it carries the whole
+          # generated bundle, which is what packaging/Makefile installs from), so
+          # unpack it there rather than into the SPA dir alone.
+          path: src-checkout/packaging/files/
 
       - name: Restore SDK build cache
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
