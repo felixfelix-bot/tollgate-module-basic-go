@@ -236,6 +236,31 @@ Token 2:
   Token: cashuA...
 ```
 
+For scripts and other non-interactive callers, `--yes` (or `-y`)
+skips the confirmation prompt:
+
+```sh
+tollgate wallet drain cashu --yes
+```
+
+Draining each mint is an independent, irreversible operation. If one
+mint's drain fails after another's succeeded, the command reports a
+**partial** result: it prints and saves the tokens that were produced,
+lists the per-mint failures, and exits non-zero. Check the output
+carefully — a partial drain means some funds left the wallet as tokens
+while others stayed in it.
+
+Every successfully produced token is also appended (before the next
+mint is attempted) to `/etc/tollgate/wallet-drain-journal.jsonl`, an
+append-only safety copy in case the terminal session or the device is
+lost before the tokens are secured. Sweep and clear that file the same
+way you treat the drain output.
+
+Cancellation and failure are distinguishable from success by exit
+code: `0` only when the whole drain succeeded; a declined or
+unanswerable prompt (e.g. stdin at EOF) and any full or partial drain
+failure exit non-zero.
+
 Treat the output file as cash — anyone who reads a token string can
 spend it. Copy it somewhere safe and delete the plaintext once
 redeemed.
@@ -247,9 +272,10 @@ redeemed.
 
 The private Wi-Fi is the network *you* (the operator) connect to,
 distinct from the captive-portal guest network. Commands operate on
-both the 2.4 GHz (`radio0`) and 5 GHz (`radio1`) private interfaces
-simultaneously. If the router only has one radio, the 5 GHz steps log
-a warning and are skipped.
+both the 2.4 GHz and 5 GHz private interfaces simultaneously; the
+radios are found by band, not by section name (which radio is 2.4 GHz
+varies between routers). If the router has no radio for one of the
+bands, that band's steps log a warning and are skipped.
 
 ### View current settings
 
@@ -327,14 +353,16 @@ for manual control.
 tollgate upstream scan
 ```
 
-Scans all radios and lists visible networks sorted by signal:
+Scans all radios and lists visible networks sorted by signal. Each entry
+also reports the band of the radio that scanned it, so a 2.4 GHz SSID can
+be told apart from a 5 GHz one without assuming radio0 is 2.4 GHz:
 
 ```
-SSID                             Signal    Ch     Encryption           Radio
---------------------------------------------------------------------------------
-HomeFibre                        -42 dBm   36     WPA2                radio1
-TollGate-Cafe                    -55 dBm   6      WPA2                radio0
-OpenGuest                        -67 dBm   11     none                radio0
+SSID                             Signal    Ch     Encryption           Radio  Band
+------------------------------------------------------------------------------------
+HomeFibre                        -42 dBm   36     WPA2                radio1 5g
+TollGate-Cafe                    -55 dBm   6      WPA2                radio0 2g
+OpenGuest                        -67 dBm   11     none                radio0 2g
 ```
 
 ### Connect
@@ -485,7 +513,13 @@ tollgate --json health
 
 When the service is unreachable, `--json` output still includes a
 `success: false` object with an `error` field rather than printing
-prose to stderr, so a wrapper script can parse the failure reliably.
+prose to stderr, so a wrapper script can parse the failure reliably —
+and the process exits non-zero whenever the reported result is a
+failure (full or partial), so exit-code checks and JSON parsing agree.
+A `wallet drain cashu` response with `"success": false` may still
+carry a `"tokens"` array inside `data`: those tokens were produced
+irreversibly and belong to you — persist them before investigating the
+`errors` entries.
 
 ## Troubleshooting
 
@@ -561,3 +595,18 @@ logread -e odhcp                                  # DHCP client logs
 
 Try moving closer to the access point, verifying the password, or
 checking that the upstream router is not out of DHCP leases.
+
+## `TOLLGATE_TEST_CONFIG_DIR` — test-only, and loud if set
+
+The `TOLLGATE_TEST_CONFIG_DIR` environment variable exists for the test
+harness: it redirects the config directory, the drain journal
+(`/etc/tollgate/wallet-drain-journal.jsonl` — **bearer tokens**) and the
+CLI socket to a temp directory. It is meant to be set only by `go test`.
+
+If it appears in a service drop-in, wrapper script or shell profile on a
+router, state silently splits: the drain journal lands elsewhere (0600,
+but wherever the variable points) while anything not sharing the
+environment still uses the stock paths. Both the service and the CLI now
+print a `WARNING: TOLLGATE_TEST_CONFIG_DIR is set` line whenever they
+honor it — if you see that line in `logread` on a production router,
+remove the variable from the environment and move the journal back.

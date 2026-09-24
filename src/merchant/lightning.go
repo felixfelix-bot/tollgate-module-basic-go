@@ -63,12 +63,26 @@ type lightningQuoteRecord struct {
 }
 
 func (m *Merchant) RequestLightningInvoice(macAddress, mintURL string, amount uint64) (*LightningInvoice, error) {
+	macAddress = NormalizeMACAddress(macAddress)
+
 	if !utils.ValidateMACAddress(macAddress) {
 		return nil, fmt.Errorf("invalid MAC address: %s", macAddress)
 	}
 	if amount == 0 {
 		return nil, fmt.Errorf("amount must be greater than zero")
 	}
+
+	// The client does not choose the spelling of the mint it pays: the portal
+	// echoes the advertisement's price_per_step tag verbatim, and that tag is
+	// accepted_mints[].url as configured — which the shipped default writes
+	// WITHOUT a trailing slash. The wallet, meanwhile, registers and keys the
+	// mint in canonical form ("<url>/"), so passing the caller's string through
+	// unchanged missed the mint map and answered "mint does not exist" on every
+	// default install. Canonicalise it once, here at the boundary where the
+	// client-supplied value enters, so the allotment lookup, the mint quote and
+	// the quote record all address the one registered mint (issue #375).
+	mintURL = tollwallet.NormalizeMintURL(mintURL)
+
 	if _, err := m.calculateAllotment(amount, mintURL); err != nil {
 		return nil, err
 	}
@@ -161,7 +175,7 @@ func (m *Merchant) getLightningQuoteRecordForMAC(quoteID, macAddress string) (*l
 	if err != nil {
 		return nil, err
 	}
-	if record.MacAddress != macAddress {
+	if NormalizeMACAddress(record.MacAddress) != NormalizeMACAddress(macAddress) {
 		return nil, fmt.Errorf("%w: %s", ErrQuoteNotFound, quoteID)
 	}
 
@@ -470,6 +484,8 @@ func (m *Merchant) grantAccessForAmount(macAddress string, amountSats uint64, mi
 }
 
 func (m *Merchant) grantSessionAccess(macAddress string, allotment uint64) (*CustomerSession, error) {
+	macAddress = NormalizeMACAddress(macAddress)
+
 	previousSession, hadSession := m.snapshotSession(macAddress)
 
 	session, err := m.AddAllotment(macAddress, m.config.Metric, allotment)
