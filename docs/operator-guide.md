@@ -236,6 +236,31 @@ Token 2:
   Token: cashuA...
 ```
 
+For scripts and other non-interactive callers, `--yes` (or `-y`)
+skips the confirmation prompt:
+
+```sh
+tollgate wallet drain cashu --yes
+```
+
+Draining each mint is an independent, irreversible operation. If one
+mint's drain fails after another's succeeded, the command reports a
+**partial** result: it prints and saves the tokens that were produced,
+lists the per-mint failures, and exits non-zero. Check the output
+carefully — a partial drain means some funds left the wallet as tokens
+while others stayed in it.
+
+Every successfully produced token is also appended (before the next
+mint is attempted) to `/etc/tollgate/wallet-drain-journal.jsonl`, an
+append-only safety copy in case the terminal session or the device is
+lost before the tokens are secured. Sweep and clear that file the same
+way you treat the drain output.
+
+Cancellation and failure are distinguishable from success by exit
+code: `0` only when the whole drain succeeded; a declined or
+unanswerable prompt (e.g. stdin at EOF) and any full or partial drain
+failure exit non-zero.
+
 Treat the output file as cash — anyone who reads a token string can
 spend it. Copy it somewhere safe and delete the plaintext once
 redeemed.
@@ -247,9 +272,10 @@ redeemed.
 
 The private Wi-Fi is the network *you* (the operator) connect to,
 distinct from the captive-portal guest network. Commands operate on
-both the 2.4 GHz (`radio0`) and 5 GHz (`radio1`) private interfaces
-simultaneously. If the router only has one radio, the 5 GHz steps log
-a warning and are skipped.
+both the 2.4 GHz and 5 GHz private interfaces simultaneously; the
+radios are found by band, not by section name (which radio is 2.4 GHz
+varies between routers). If the router has no radio for one of the
+bands, that band's steps log a warning and are skipped.
 
 ### View current settings
 
@@ -327,14 +353,16 @@ for manual control.
 tollgate upstream scan
 ```
 
-Scans all radios and lists visible networks sorted by signal:
+Scans all radios and lists visible networks sorted by signal. Each entry
+also reports the band of the radio that scanned it, so a 2.4 GHz SSID can
+be told apart from a 5 GHz one without assuming radio0 is 2.4 GHz:
 
 ```
-SSID                             Signal    Ch     Encryption           Radio
---------------------------------------------------------------------------------
-HomeFibre                        -42 dBm   36     WPA2                radio1
-TollGate-Cafe                    -55 dBm   6      WPA2                radio0
-OpenGuest                        -67 dBm   11     none                radio0
+SSID                             Signal    Ch     Encryption           Radio  Band
+------------------------------------------------------------------------------------
+HomeFibre                        -42 dBm   36     WPA2                radio1 5g
+TollGate-Cafe                    -55 dBm   6      WPA2                radio0 2g
+OpenGuest                        -67 dBm   11     none                radio0 2g
 ```
 
 ### Connect
@@ -485,7 +513,13 @@ tollgate --json health
 
 When the service is unreachable, `--json` output still includes a
 `success: false` object with an `error` field rather than printing
-prose to stderr, so a wrapper script can parse the failure reliably.
+prose to stderr, so a wrapper script can parse the failure reliably —
+and the process exits non-zero whenever the reported result is a
+failure (full or partial), so exit-code checks and JSON parsing agree.
+A `wallet drain cashu` response with `"success": false` may still
+carry a `"tokens"` array inside `data`: those tokens were produced
+irreversibly and belong to you — persist them before investigating the
+`errors` entries.
 
 ## Troubleshooting
 
@@ -561,3 +595,68 @@ logread -e odhcp                                  # DHCP client logs
 
 Try moving closer to the access point, verifying the password, or
 checking that the upstream router is not out of DHCP leases.
+
+### A customer paid but has no access, and was shown a reference
+
+When the mint does not answer a payment within its 30-second deadline the
+module does not claim the payment failed. It says the outcome is
+**unknown** and shows the customer a **reference**: 16 hex characters,
+the salted fingerprint of the note they sent. (The note itself is never
+written to a log — anyone holding it can spend it — so the reference is
+the only handle that ties the customer to the attempt.)
+
+Search the log for it:
+
+```sh
+logread -e tollgate | grep '<reference the customer showed you>'
+```
+
+The reference appears on the deadline line and again on the line that
+answers the question you actually have — what the mint did with the note:
+
+- `late Receive COMPLETED … amount=N — the mint took the note and no
+  session was granted; credit or refund it` — the customer's value is in
+  the operator wallet and they received nothing. **Nothing credits or
+  refunds this automatically today**, so settle it by hand, explicitly
+  (grant the device access, or return the value to an address the
+  customer controls) and note what you did.
+- `late Receive FAILED (outcome still ambiguous) …: <error> — the mint may
+  have taken the note; check the wallet balance for the mint before
+  resubmitting anything, no session was granted` — the late answer was not
+  the mint saying "no". This is what a timeout or another unreachable-class
+  error looks like, and it is the **common** case rather than the odd one:
+  the module's deadline and the wallet's own HTTP client both run on 30
+  seconds, so the first answer to arrive late is normally a client-side one
+  that says nothing about what the mint did with the note. **Do not tell the
+  customer to send it again.** Check the mint's balance for the amount first;
+  if the note was credited, settle it by hand as in the `COMPLETED` case
+  above; invite a resubmission only once you have established the mint did
+  not take it.
+- `late Receive FAILED …: <mint error> — the mint did not take the note, no
+  session was granted` — the mint itself refused the note, and a refusal is
+  the one answer only the mint can give: the proofs were already spent
+  elsewhere, they sit on a retired keyset, they cannot cover the swap fee, or
+  the request was rejected outright. The note was never spent. The customer
+  can safely submit it again.
+
+If you see only the `Receive outcome unknown` line, the money-moving
+request had not finished when you looked — or the process was restarted
+while it was in flight, in which case no outcome line will ever be
+written. Re-check the log before telling the customer anything. The
+durable journal that would settle a late outcome automatically is not
+implemented; the reference plus these lines are the whole procedure.
+
+## `TOLLGATE_TEST_CONFIG_DIR` — test-only, and loud if set
+
+The `TOLLGATE_TEST_CONFIG_DIR` environment variable exists for the test
+harness: it redirects the config directory, the drain journal
+(`/etc/tollgate/wallet-drain-journal.jsonl` — **bearer tokens**) and the
+CLI socket to a temp directory. It is meant to be set only by `go test`.
+
+If it appears in a service drop-in, wrapper script or shell profile on a
+router, state silently splits: the drain journal lands elsewhere (0600,
+but wherever the variable points) while anything not sharing the
+environment still uses the stock paths. Both the service and the CLI now
+print a `WARNING: TOLLGATE_TEST_CONFIG_DIR is set` line whenever they
+honor it — if you see that line in `logread` on a production router,
+remove the variable from the environment and move the journal back.
