@@ -100,9 +100,17 @@ is exactly how the old entry's failure became over-determined.
 starts the module it writes a fixture lease for the two loopback addresses it
 drives — `127.0.0.1` (the module API) and `127.0.0.2` (the portal lane's
 browser) — to `dhcpLeasePath` (`/tmp/dhcp.leases`, or bound into the module
-container at that path when the host cannot run the artifact natively), and
-restores whatever the host had when it exits. `HP_CLIENT_MAC` overrides the
-identity (default `02:00:00:00:00:20`). The check
+container at that path when the host cannot run the artifact natively).
+`HP_CLIENT_MAC` overrides the identity (default `02:00:00:00:00:20`).
+
+How it touches that file matters, because on this fleet `/tmp/dhcp.leases` is a
+symlink another process owns. It is written **in place and never moved, renamed
+or deleted**: if the file already maps both addresses the suite writes nothing
+at all; otherwise it prepends its two fixture lines (the host's own entries stay
+valid for the run) and writes the original content back through the same path on
+exit; if the path does not exist it creates it and removes it again. The one
+residual window — a host process writing to the same file during the run — is
+stated in the script rather than hidden. The check
 `api:whoami-unresolved-client-not-keyed` is the control: an unleased caller
 (`127.0.0.3`) must NOT be keyed, so a fixture that silently stopped working
 cannot pass as green.

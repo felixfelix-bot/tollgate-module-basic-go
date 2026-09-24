@@ -93,14 +93,18 @@ mkdir -p "$EVIDENCE"
 # The identity the suite keys on. 02:00:00:00:00:20 is a documentation address
 # (RFC 7042), the same one the cloud-lab lease fixture uses.
 HP_CLIENT_MAC="${HP_CLIENT_MAC:-02:00:00:00:00:20}"
-# The identity source the module reads (src/main.go: dhcpLeasePath) and the
-# backup the suite restores on exit. Section 1b owns this: the module derives a
-# client's MAC from the socket, and no loopback address is in any real lease
-# file, so off-router the suite has to provide one.
+# The identity source the module reads (src/main.go: dhcpLeasePath). Section 1b
+# owns it: the module derives a client's MAC from the socket, and no loopback
+# address is in any real lease file, so off-router the suite has to provide one.
+# NOTE these are ALWAYS written IN PLACE — the file is never moved, renamed or
+# deleted (on this fleet /tmp/dhcp.leases is a symlink another process owns), so
+# a failure anywhere leaves the host with a working file plus at most two
+# harmless extra fixture lines. See section 1b.
 LEASE_PATH="/tmp/dhcp.leases"
 LEASE_FIXTURE="$WORK/dhcp.leases"
-LEASE_BACKUP="$WORK/dhcp.leases.pre-suite"
-LEASE_INSTALLED=0
+LEASE_BEFORE="$WORK/dhcp.leases.pre-suite"
+LEASE_CREATED=0      # 1 = the path did not exist and this suite created it
+LEASE_HAD_FILE=0     # 1 = a file was there; its content is in $LEASE_BEFORE
 
 TOTAL=0; PASSED=0; FAILED_N=0; SKIPPED=0
 FAILED_IDS=""
@@ -124,12 +128,17 @@ cleanup() {
     [ -n "$MOD_PID" ] && kill "$MOD_PID" 2>/dev/null
     [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null
     wait 2>/dev/null
-    # Put back whatever lease file this host had before the suite replaced it.
-    if [ "$LEASE_INSTALLED" = "1" ]; then
+    # Give the lease path back the way it was found. Both branches write IN
+    # PLACE (a shell redirection, same inode — a symlink stays a symlink), so a
+    # process that owns the file never sees it vanish; the worst case, if this
+    # restore fails, is that the two fixture lines stay behind.
+    # Residual, stated rather than hidden: a host process that writes to the
+    # same file DURING the run can be overwritten by this restore.
+    if [ "$LEASE_CREATED" = "1" ]; then
         rm -f "$LEASE_PATH" 2>/dev/null
-        if [ -e "$LEASE_BACKUP" ] || [ -L "$LEASE_BACKUP" ]; then
-            mv "$LEASE_BACKUP" "$LEASE_PATH" 2>/dev/null
-        fi
+    elif [ "$LEASE_HAD_FILE" = "1" ] && [ -s "$LEASE_BEFORE" ]; then
+        cat "$LEASE_BEFORE" > "$LEASE_PATH" 2>/dev/null || \
+            note "could not restore $LEASE_PATH (the file is intact; it still carries the two fixture lines)"
     fi
     if [ "$KEEP" = "1" ]; then
         note "work dir kept: $WORK"
@@ -241,27 +250,63 @@ fi
 #
 # So the suite now owns it: one fixture lease keyed to the two loopback
 # addresses it drives (127.0.0.1 = the module API, 127.0.0.2 = the portal lane's
-# browser), installed where the module it is about to start will read it, with
-# whatever the host had restored on exit.
+# browser), installed where the module it is about to start will read it.
+#
+# HOW IT TOUCHES THE FILE (cross-family review round 1, findings 1+2): the file
+# is written IN PLACE and never moved, renamed or deleted. On this fleet
+# /tmp/dhcp.leases is a SYMLINK owned by another process (/var/tmp/minturl/…),
+# so `mv`-ing it aside for the duration is not safe — leases written while it is
+# away would be lost and the original inode would be swapped back under the
+# owner. Instead: copy the existing content aside for evidence, prepend the two
+# fixture lines (a client of the owner keeps its file and its other entries),
+# and on exit write the original content back through the same path. If the path
+# does not exist the suite creates it and removes it again. A crash anywhere in
+# between leaves the owner with its file plus two harmless fixture lines; the
+# only residual window is a write by the owner DURING the run, which the restore
+# can overwrite — stated here instead of hidden.
+lease_lines() {  # lease_lines <mac> — the exact two lines this suite adds
+    printf '1700000000 %s 127.0.0.1 hp-client *\n' "$1"
+    printf '1700000000 %s 127.0.0.2 hp-client *\n' "$1"
+}
+lease_has() {  # lease_has <mac> <ip> — already mapped by the file?
+    awk -v mac="$1" -v want="$2" '
+        { if (tolower($2) == tolower(mac) && $3 == want) found = 1 }
+        END { exit(found ? 0 : 1) }' "$LEASE_PATH" 2>/dev/null
+}
 if [ "$RUN_MODULE" = "1" ]; then
-    {
-        printf '1700000000 %s 127.0.0.1 hp-client *\n' "$HP_CLIENT_MAC"
-        printf '1700000000 %s 127.0.0.2 hp-client *\n' "$HP_CLIENT_MAC"
-    } > "$LEASE_FIXTURE"
+    lease_lines "$HP_CLIENT_MAC" > "$LEASE_FIXTURE"
 
     if [ "$RUN_MODE" = "container" ]; then
         # The module runs in its own container, so the fixture is bound in
         # there; the host's own lease file is left alone.
-        chk env:identity-lease PASS "fixture lease (127.0.0.1, 127.0.0.2 -> $HP_CLIENT_MAC) bound into the module container at $LEASE_PATH"
+        chk env:identity-lease PASS "fixture lease (127.0.0.1, 127.0.0.2 -> $HP_CLIENT_MAC) bound into the module container at $LEASE_PATH; the host file was not touched"
+    elif lease_has "$HP_CLIENT_MAC" 127.0.0.1 && lease_has "$HP_CLIENT_MAC" 127.0.0.2; then
+        chk env:identity-lease PASS "$LEASE_PATH already maps 127.0.0.1 and 127.0.0.2 to $HP_CLIENT_MAC — host-supplied, nothing written"
     else
+        # Our lines go FIRST: getMacAddress() returns the first match, so the
+        # fixture wins over a stale entry for the same address.
         if [ -e "$LEASE_PATH" ] || [ -L "$LEASE_PATH" ]; then
-            mv "$LEASE_PATH" "$LEASE_BACKUP" 2>/dev/null || cp -a "$LEASE_PATH" "$LEASE_BACKUP"
+            lease_lines "$HP_CLIENT_MAC" > "$LEASE_FIXTURE"
+            cat "$LEASE_PATH" 2>/dev/null >> "$LEASE_FIXTURE"
+            # The backup is the ORIGINAL CONTENT (the two fixture lines dropped),
+            # built from the same read: `cp -a` would copy the symlink itself,
+            # and a later `cat backup > path` on a same-inode pair truncates the
+            # file it is about to read (measured 2026-09-24 on this fleet, where
+            # /tmp/dhcp.leases is a symlink).
+            tail -n +3 "$LEASE_FIXTURE" > "$LEASE_BEFORE" 2>/dev/null
+            LEASE_HAD_FILE=1
         fi
-        if cp "$LEASE_FIXTURE" "$LEASE_PATH"; then
-            LEASE_INSTALLED=1
-            chk env:identity-lease PASS "fixture lease (127.0.0.1, 127.0.0.2 -> $HP_CLIENT_MAC) installed at $LEASE_PATH; restored on exit (previous file: $LEASE_BACKUP)"
+        if [ "$LEASE_HAD_FILE" = "0" ]; then
+            LEASE_CREATED=1
+        fi
+        if cat "$LEASE_FIXTURE" > "$LEASE_PATH" 2>/dev/null; then
+            if [ "$LEASE_CREATED" = "1" ]; then
+                chk env:identity-lease PASS "fixture lease (127.0.0.1, 127.0.0.2 -> $HP_CLIENT_MAC) written to $LEASE_PATH (did not exist; removed on exit)"
+            else
+                chk env:identity-lease PASS "fixture lease (127.0.0.1, 127.0.0.2 -> $HP_CLIENT_MAC) prepended to $LEASE_PATH in place; the host's own content is kept for the run and written back on exit (no move, no delete)"
+            fi
         else
-            chk env:identity-lease FAIL "could not write $LEASE_PATH — the module cannot resolve a client without it"
+            chk env:identity-lease FAIL "could not write $LEASE_PATH — the module cannot resolve a client without it (host file untouched: $LEASE_HAD_FILE)"
         fi
     fi
 fi

@@ -114,8 +114,14 @@ jobs for environment reasons the lane itself had never been able to see:
   and the suite relied on the operator having seeded `/tmp/dhcp.leases` by hand —
   true on this fleet, false in a container, where `api:whoami` answered an empty
   `mac` and `POST /ln-invoice` returned 400 `device-unresolved` (20/23). Section 1b
-  of `tests/happy-path/run.sh` now seeds the fixture itself and restores the host's
-  file on exit, with `api:whoami-unresolved-client-not-keyed` as the control.
+  of `tests/happy-path/run.sh` now seeds that file itself — IN PLACE: nothing is
+  moved, renamed or deleted (this fleet's `/tmp/dhcp.leases` is a symlink another
+  process owns), the host's own entries stay valid, and the original content is
+  written back through the same path on exit — with
+  `api:whoami-unresolved-client-not-keyed` as the control. A cold cross-family
+  review's round-1 findings on the first version of this seeding (a `mv`-aside
+  design, and a probe that only checked a file EXISTED) are what produced the
+  in-place design and `stage-checkout.sh`'s content-digest probe.
 
 ### Reading a result
 

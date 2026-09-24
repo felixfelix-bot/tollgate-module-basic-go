@@ -22,6 +22,12 @@
 #    request, so no shared filesystem is involved;
 # 3. re-probes and reports. Exit 0 means the client container will see the tests.
 #
+# The probe compares a CONTENT DIGEST, not mere existence (cross-family review
+# round 1, finding 3): a stale or unrelated tree at the same path must not be
+# mistaken for this checkout, and it must not be silently overwritten either. So:
+# digest equal ⇒ nothing to do; digest absent ⇒ stage; digest present but
+# different ⇒ REFUSE (exit 6), because that path belongs to something else.
+#
 # The destination is the same path the client service binds, by construction:
 # the daemon's view of <target>. Locally the probe succeeds and this is a no-op.
 #
@@ -32,6 +38,7 @@
 #
 # Exit codes: 0 staged/visible (or nothing to do) | 3 no docker daemon
 #             | 4 the stream failed | 5 staged but the daemon still cannot read it
+#             | 6 the daemon has a DIFFERENT checkout at the target (refusing to clobber)
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -53,17 +60,29 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     exit 3
 fi
 
-# The probe mounts the target read-only and asks the daemon's own view whether
-# the compose file is there. A path the daemon does not have appears as an empty
-# directory (docker creates it), so `test -f` is the honest question.
-daemon_sees() {
+# The marker file is the identity of the tree at $TARGET: its digest is what
+# distinguishes "this checkout" from "some other directory that happens to be
+# at the same path". A path the daemon does not have appears as an empty
+# directory (docker creates it), so the digest comes back empty.
+MARKER=docker-compose.yml
+LOCAL_DIGEST="$(sha256sum "$HERE/$MARKER" | awk '{print $1}')"
+
+daemon_digest() {  # digest the DAEMON computes for $TARGET/$MARKER, or empty
     docker run --rm -v "${1}:/probe:ro" "$STAGE_IMAGE" \
-        sh -c 'test -f /probe/docker-compose.yml' >/dev/null 2>&1
+        sh -c "sha256sum /probe/$MARKER 2>/dev/null | cut -d' ' -f1" 2>/dev/null | tr -d '\r\n'
 }
 
-if [ "$FORCE" != "1" ] && daemon_sees "$TARGET"; then
-    echo "STAGE visible: the docker daemon already reads $TARGET (nothing to do)"
-    exit 0
+if [ "$FORCE" != "1" ]; then
+    SEEN="$(daemon_digest "$TARGET")"
+    if [ "$SEEN" = "$LOCAL_DIGEST" ]; then
+        echo "STAGE visible: the docker daemon already reads THIS checkout at $TARGET (digest matches, nothing to do)"
+        exit 0
+    fi
+    if [ -n "$SEEN" ]; then
+        echo "STAGE refusing: $TARGET on the daemon holds a DIFFERENT $MARKER (digest $SEEN, this checkout is $LOCAL_DIGEST)." >&2
+        echo "                Staging would overwrite another checkout's tree. Use a different path (COMPOSE project/checkout) or clean it up." >&2
+        exit 6
+    fi
 fi
 
 if ! tar -C "$HERE" -cf - . 2>/dev/null | \
@@ -72,10 +91,11 @@ if ! tar -C "$HERE" -cf - . 2>/dev/null | \
     exit 4
 fi
 
-if daemon_sees "$TARGET"; then
-    echo "STAGE staged: $HERE -> the daemon's ${TARGET} ($(find "$HERE" -maxdepth 1 -name '*.py' | wc -l) python test file(s))"
+AFTER="$(daemon_digest "$TARGET")"
+if [ "$AFTER" = "$LOCAL_DIGEST" ]; then
+    echo "STAGE staged: $HERE -> the daemon's ${TARGET} ($(find "$HERE" -maxdepth 1 -name '*.py' | wc -l) python test file(s), digest verified)"
     exit 0
 fi
 
-echo "STAGE unreadable: staged into ${TARGET} but the daemon still cannot read it" >&2
+echo "STAGE unreadable: staged into ${TARGET} but the daemon reports digest '${AFTER}' (wanted $LOCAL_DIGEST)" >&2
 exit 5
