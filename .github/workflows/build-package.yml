@@ -396,6 +396,15 @@ jobs:
           # /tmp/tollgate-captive-portal-site.
           bash tests/packaging/assert-portal-bundle-contract.sh
 
+      # MUTANT FIXTURE (fork-only vehicle branch; never a PR to upstream).
+      # Runs AFTER the contract guard on purpose (see the script header): the
+      # guard sees the honest pinned tree, then the guest SPA and the admin
+      # board are re-vendored from the PRE-#60 portal revision while the pin
+      # stays correct - so the artifact the apk lane packages, and therefore the
+      # release-lane happy-path gate, sees bytes no source-level guard can see.
+      - name: "MUTANT: ship the pre-#60 portal bundle with an honest pin"
+        run: bash .github/scripts/mutant-prev60-swap.sh
+
       - name: Resolve portal commit SHA
         id: portal-sha
         run: |

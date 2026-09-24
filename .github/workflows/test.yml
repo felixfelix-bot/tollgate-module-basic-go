@@ -180,6 +180,15 @@ jobs:
       - name: Assert the portal bundle contract
         run: bash tests/packaging/assert-portal-bundle-contract.sh
 
+      # MUTANT FIXTURE (fork-only vehicle branch; never a PR to upstream).
+      # Runs AFTER the contract guard on purpose: the guard inspects the honest
+      # pinned tree, then the guest SPA is re-vendored from the PRE-#60 portal
+      # revision while the pin stays correct, so the packaged artifact - not the
+      # provenance record - is what carries the regression. Header of the script
+      # explains why that is the release-shipped shape.
+      - name: "MUTANT: ship the pre-#60 portal bundle with an honest pin"
+        run: bash .github/scripts/mutant-prev60-swap.sh
+
       # The .ipk and the SDK-built .apk carry the same runtime payload the suite
       # consumes (usr/bin/tollgate-wrt + the portal bundle under
       # etc/tollgate/tollgate-captive-portal-site). Building the x86_64 .ipk with
