@@ -52,6 +52,8 @@ Environment:
                    chromium
   HP_TMPDIR        parent for the work dir (default /var/tmp -- a 3.6 GiB tmpfs
                    at /tmp is not a safe place for extracted packages)
+  HP_CLIENT_MAC    the identity the suite seeds for its two loopback clients
+                   (default 02:00:00:00:00:20; see "Precondition" in README.md)
   HP_MODULE_PORT   module port (default 2121; the shipped portal bundle hardcodes
                    http://<hostname>:2121, so change this only with a reason)
   HP_MUSL_LIBGCC   path to a musl libgcc_s.so.1 for hosts that cannot run the
@@ -88,6 +90,18 @@ WORK="$(mktemp -d "$TMP_PARENT/tg-happy-path.XXXXXX")" || exit 1
 EVIDENCE="${OUT:-$WORK/evidence}"
 mkdir -p "$EVIDENCE"
 
+# The identity the suite keys on. 02:00:00:00:00:20 is a documentation address
+# (RFC 7042), the same one the cloud-lab lease fixture uses.
+HP_CLIENT_MAC="${HP_CLIENT_MAC:-02:00:00:00:00:20}"
+# The identity source the module reads (src/main.go: dhcpLeasePath) and the
+# backup the suite restores on exit. Section 1b owns this: the module derives a
+# client's MAC from the socket, and no loopback address is in any real lease
+# file, so off-router the suite has to provide one.
+LEASE_PATH="/tmp/dhcp.leases"
+LEASE_FIXTURE="$WORK/dhcp.leases"
+LEASE_BACKUP="$WORK/dhcp.leases.pre-suite"
+LEASE_INSTALLED=0
+
 TOTAL=0; PASSED=0; FAILED_N=0; SKIPPED=0
 FAILED_IDS=""
 
@@ -110,6 +124,13 @@ cleanup() {
     [ -n "$MOD_PID" ] && kill "$MOD_PID" 2>/dev/null
     [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null
     wait 2>/dev/null
+    # Put back whatever lease file this host had before the suite replaced it.
+    if [ "$LEASE_INSTALLED" = "1" ]; then
+        rm -f "$LEASE_PATH" 2>/dev/null
+        if [ -e "$LEASE_BACKUP" ] || [ -L "$LEASE_BACKUP" ]; then
+            mv "$LEASE_BACKUP" "$LEASE_PATH" 2>/dev/null
+        fi
+    fi
     if [ "$KEEP" = "1" ]; then
         note "work dir kept: $WORK"
     else
@@ -207,6 +228,45 @@ if [ -n "$MODULE_BIN" ]; then
 fi
 
 # --------------------------------------------------------------------------
+# 1b. The identity source: the suite seeds the lease it needs
+# --------------------------------------------------------------------------
+# The module identifies the caller from the SOCKET, never from a client claim:
+# clientMACFromSocket() reads dhcpLeasePath (/tmp/dhcp.leases) and then
+# /proc/net/arp (src/main.go). Neither carries an entry for a loopback client,
+# so off-router the suite has to supply one. README.md used to leave that to
+# the operator, which made a local run green only on a host where somebody had
+# already seeded the file by hand — and made the CI lane fail on identity
+# instead of on what it covers (api:whoami answered an empty mac, POST
+# /ln-invoice 400 device-unresolved; ngit lane regression.yml, 2026-09-24).
+#
+# So the suite now owns it: one fixture lease keyed to the two loopback
+# addresses it drives (127.0.0.1 = the module API, 127.0.0.2 = the portal lane's
+# browser), installed where the module it is about to start will read it, with
+# whatever the host had restored on exit.
+if [ "$RUN_MODULE" = "1" ]; then
+    {
+        printf '1700000000 %s 127.0.0.1 hp-client *\n' "$HP_CLIENT_MAC"
+        printf '1700000000 %s 127.0.0.2 hp-client *\n' "$HP_CLIENT_MAC"
+    } > "$LEASE_FIXTURE"
+
+    if [ "$RUN_MODE" = "container" ]; then
+        # The module runs in its own container, so the fixture is bound in
+        # there; the host's own lease file is left alone.
+        chk env:identity-lease PASS "fixture lease (127.0.0.1, 127.0.0.2 -> $HP_CLIENT_MAC) bound into the module container at $LEASE_PATH"
+    else
+        if [ -e "$LEASE_PATH" ] || [ -L "$LEASE_PATH" ]; then
+            mv "$LEASE_PATH" "$LEASE_BACKUP" 2>/dev/null || cp -a "$LEASE_PATH" "$LEASE_BACKUP"
+        fi
+        if cp "$LEASE_FIXTURE" "$LEASE_PATH"; then
+            LEASE_INSTALLED=1
+            chk env:identity-lease PASS "fixture lease (127.0.0.1, 127.0.0.2 -> $HP_CLIENT_MAC) installed at $LEASE_PATH; restored on exit (previous file: $LEASE_BACKUP)"
+        else
+            chk env:identity-lease FAIL "could not write $LEASE_PATH — the module cannot resolve a client without it"
+        fi
+    fi
+fi
+
+# --------------------------------------------------------------------------
 # 2. Hermetic workspace: config dir, fake ndsctl on PATH, stub mint
 # --------------------------------------------------------------------------
 CFG_DIR="$WORK/config"
@@ -269,6 +329,7 @@ start_module() {
         docker run --rm --name "tg-happy-path-$$" --network host \
             -v "$ARTIFACT":/artifact:ro -v "$CFG_DIR":/cfg -v "$FAKE_BIN":/fakebin:ro \
             -v "$NDSCTL_LOG":/fakebin/ndsctl.log \
+            -v "$LEASE_FIXTURE":/tmp/dhcp.leases:ro \
             -e TOLLGATE_TEST_CONFIG_DIR=/cfg -e PATH=/fakebin:/usr/local/bin:/usr/bin:/bin \
             -e NDSCTL_LOG=/fakebin/ndsctl.log \
             alpine:3.20 /artifact/usr/bin/tollgate-wrt > "$WORK/module.log" 2>&1 &
@@ -346,6 +407,23 @@ if [ "$MOD_UP" = "1" ]; then
         mac=*:*) chk api:whoami PASS "/whoami -> HTTP $CODE $(printf '%s' "$W" | head -c 60)" ;;
         *)       chk api:whoami FAIL "/whoami -> HTTP $CODE body: $(printf '%s' "$W" | head -c 160)" ;;
     esac
+
+    # --- C5b: negative control — a client with no lease is not keyed -------
+    # 127.0.0.3 appears in no fixture lease and in no ARP table, so this is the
+    # control that the lease seeded in 1b is what makes C5 pass, not something
+    # else on the host. It also keeps the unresolved state observable: an
+    # identity-less caller is echoed an EMPTY mac (/whoami is an echo; the
+    # payment path is where the module refuses with 400 device-unresolved).
+    NC="$(curl -s -m 25 -o "$WORK/nc-body" -w '%{http_code}' \
+            "http://127.0.0.3:$MODULE_PORT/whoami" 2>/dev/null)"
+    NCB="$(cat "$WORK/nc-body" 2>/dev/null)"
+    if [ "$NC" != "200" ]; then
+        chk api:whoami-unresolved-client-not-keyed FAIL "the unleased client 127.0.0.3 got no answer (HTTP $NC) — the control cannot be read"
+    elif printf '%s' "$NCB" | grep -qE 'mac=[0-9a-fA-F]{2}:'; then
+        chk api:whoami-unresolved-client-not-keyed FAIL "an unleased client (127.0.0.3) was keyed: HTTP $NC body: $(printf '%s' "$NCB" | head -c 80)"
+    else
+        chk api:whoami-unresolved-client-not-keyed PASS "an unleased client (127.0.0.3) is not keyed: HTTP $NC $(printf '%s' "$NCB" | head -c 60)"
+    fi
 
     # --- C6: /balance ------------------------------------------------------
     B="$(http /balance)"

@@ -94,18 +94,26 @@ The lane POSTs `/ln-invoice` and the module resolves the client's identity from
 the **socket** (`clientMACFromSocket`, `src/main.go`), refusing the request when
 it cannot: a client-supplied `mac` is not an identity. Off-router the harness's
 browser talks to `127.0.0.2`, which appears in no lease and no ARP table — which
-is exactly how the old entry's failure became over-determined. To exercise the
-lane, seed the module's own lease source (`dhcpLeasePath`, default
-`/tmp/dhcp.leases`) with the client address first:
+is exactly how the old entry's failure became over-determined.
 
-```bash
-printf '1700000000 02:00:00:00:00:20 127.0.0.2 hp-client *\n' > /tmp/dhcp.leases
-```
+**The suite now seeds that source itself** (section 1b of `run.sh`): before it
+starts the module it writes a fixture lease for the two loopback addresses it
+drives — `127.0.0.1` (the module API) and `127.0.0.2` (the portal lane's
+browser) — to `dhcpLeasePath` (`/tmp/dhcp.leases`, or bound into the module
+container at that path when the host cannot run the artifact natively), and
+restores whatever the host had when it exits. `HP_CLIENT_MAC` overrides the
+identity (default `02:00:00:00:00:20`). The check
+`api:whoami-unresolved-client-not-keyed` is the control: an unleased caller
+(`127.0.0.3`) must NOT be keyed, so a fixture that silently stopped working
+cannot pass as green.
 
-With that in place the lane reaches the mint, and the check asserts the real
-thing: the module answers 200 with a bolt11 for the un-slashed URL the portal
-sends. Without it, the lane fails on identity (`device-unresolved`) rather than
-on the mint URL — an honest failure, but not this suite's subject.
+Before 2026-09-24 this was left to the operator. That made a local run green
+only on a host where someone had already seeded the file by hand, and made the
+CI lane fail on identity instead of on what it covers (`api:whoami` an empty
+`mac`, `POST /ln-invoice` 400 `device-unresolved`; ngit lane `regression.yml`,
+job `happy-path`, 20/23). With the fixture in place the lane reaches the mint,
+and the check asserts the real thing: the module answers 200 with a bolt11 for
+the un-slashed URL the portal sends.
 
 ## Evidence from the first run (2026-09-23)
 

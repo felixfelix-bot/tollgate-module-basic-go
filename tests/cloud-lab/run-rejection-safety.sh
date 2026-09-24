@@ -37,6 +37,10 @@ trap cleanup EXIT
 
 echo "== Phase A1: mint up — fund and stash the token"
 "${COMPOSE[@]}" up -d --build mint mint-fees upstream >/dev/null
+
+# The client bind-mounts this directory at /tests; a bind source is resolved by
+# the docker daemon, so make the tests visible to it first (no-op locally).
+bash "$SCRIPT_DIR/stage-checkout.sh"
 REJECTION_LANE=1 "${COMPOSE[@]}" run --rm -e REJECTION_LANE --entrypoint sh client \
     -c 'rm -rf /tests/__pycache__ && cd /tests && python3 -m pytest -q test_rejection_safety.py::TestOutageDoesNotBurnToken -k phase_a1'
 

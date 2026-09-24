@@ -164,9 +164,28 @@ run_cloud_lab_lane() {
     local compose=(docker compose -p tollgate-regression -f docker-compose.yml)
     local rc=0
 
+    # The client service bind-mounts this directory at /tests, and a bind source
+    # is resolved by the DOCKER DAEMON. When the daemon is not the local one (an
+    # `act` job reaching the host daemon) it binds an empty directory and the
+    # client would find no tests. stage-checkout.sh probes and, only then,
+    # streams the tree through the daemon API. A no-op locally.
+    echo "=== lane cloud-lab: making the tests visible to the docker daemon ==="
+    if ! bash stage-checkout.sh 2>&1 | tee "$EVIDENCE/cloud-lab-stage.log"; then
+        lane cloud-lab FAIL "could not make tests/cloud-lab visible to the docker daemon (log: $EVIDENCE/cloud-lab-stage.log)"
+        cd "$REPO_ROOT"; return
+    fi
+
     echo "=== lane cloud-lab: building + starting mint and upstream ==="
     if ! "${compose[@]}" up -d --build mint upstream 2>&1 | tee "$EVIDENCE/cloud-lab-up.log"; then
         lane cloud-lab FAIL "docker compose up failed (log: $EVIDENCE/cloud-lab-up.log)"
+        [ "$KEEP" = "1" ] || "${compose[@]}" down -v >/dev/null 2>&1
+        cd "$REPO_ROOT"; return
+    fi
+
+    # The client image is not part of `up` (the service is a one-off runner), and
+    # `compose run` does not build a missing image on its own.
+    if ! "${compose[@]}" build client 2>&1 | tee "$EVIDENCE/cloud-lab-client-build.log"; then
+        lane cloud-lab FAIL "docker compose build client failed (log: $EVIDENCE/cloud-lab-client-build.log)"
         [ "$KEEP" = "1" ] || "${compose[@]}" down -v >/dev/null 2>&1
         cd "$REPO_ROOT"; return
     fi

@@ -34,10 +34,11 @@ services:
 
   upstream:
     ports: !override []
-    volumes: !override
-      - ./configs/upstream-config-bytes.json:/etc/tollgate/config.json
-      - ./configs/install.json:/etc/tollgate/install.json
-      - ./configs/dhcp.leases.bytes:/tmp/dhcp.leases
+    # Config selection (not a bind mount: see the base file's note) — the bytes
+    # lab runs the module on byte-metered steps with the bytes lease file.
+    environment:
+      - LAB_CONFIG=upstream-config-bytes.json
+      - LAB_LEASES=dhcp.leases.bytes
     networks:
       tollgate-lab:
         ipv4_address: 172.28.0.10
@@ -48,10 +49,9 @@ services:
     ports: !override []
     cap_add:
       - NET_ADMIN
-    volumes: !override
-      - ./configs/reseller-config-bytes.json:/etc/tollgate/config.json
-      - ./configs/install.json:/etc/tollgate/install.json
-      - ./configs/dhcp.leases:/tmp/dhcp.leases
+    environment:
+      - LAB_CONFIG=reseller-config-bytes.json
+      - LAB_LEASES=dhcp.leases
     networks:
       tollgate-lab:
         ipv4_address: 172.28.0.11

@@ -94,6 +94,29 @@ pinned-toolchain green, while a local green is a behaviour green on the host's
 toolchain. `packaging/`'s own guard is untouched: a packaging or release build
 still refuses a mismatched toolchain.
 
+### The two failures the first CI run of this lane surfaced (fixed 2026-09-24)
+
+The lane ran on the coordinator for the first time on 2026-09-24 and failed BOTH
+jobs for environment reasons the lane itself had never been able to see:
+
+* **`cloud-lab` — the lab's inputs were bind-mounted from the checkout.** A bind
+  source is resolved by the DOCKER DAEMON, not by the CLI: in an `act` job the
+  CLI is inside the act container while the daemon is the host's, so
+  `./configs/upstream-config.json` arrived as an empty DIRECTORY and the module
+  refused to boot (`read /etc/tollgate/config.json: is a directory`). The lab
+  configs are now **baked into the image** (`tests/cloud-lab/Dockerfile.tollgate`
+  + `lab-entrypoint.sh`, selected per service by `LAB_CONFIG`/`LAB_LEASES`), and
+  the client's `/tests` directory is staged to the daemon on demand by
+  `tests/cloud-lab/stage-checkout.sh` (a probe, then `tar` over stdin through
+  `docker run -i`, so no shared filesystem is assumed). Locally both are no-ops.
+* **`happy-path` — the suite had no identity source of its own.** The module
+  resolves a caller's MAC from the socket (`dhcpLeasePath`, then `/proc/net/arp`),
+  and the suite relied on the operator having seeded `/tmp/dhcp.leases` by hand —
+  true on this fleet, false in a container, where `api:whoami` answered an empty
+  `mac` and `POST /ln-invoice` returned 400 `device-unresolved` (20/23). Section 1b
+  of `tests/happy-path/run.sh` now seeds the fixture itself and restores the host's
+  file on exit, with `api:whoami-unresolved-client-not-keyed` as the control.
+
 ### Reading a result
 
 * **ngit CI** publishes signed results to Nostr — there is no web URL. Read them

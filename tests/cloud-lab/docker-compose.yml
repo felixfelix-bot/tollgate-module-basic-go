@@ -11,6 +11,17 @@
 # another worktree's built images. Set COMPOSE_PROJECT_NAME (a gitignored
 # .env in this directory is auto-loaded; see .env.example) or pass -p to
 # isolate a checkout.
+#
+# INPUTS ARE BAKED INTO THE IMAGES (2026-09-24). config.json / install.json /
+# dhcp.leases used to be bind-mounted per service from ./configs. A bind source
+# is resolved by the DOCKER DAEMON, so that only works when the daemon can see
+# this checkout — in an act job that reaches the host daemon it cannot, and
+# docker silently created a DIRECTORY at /etc/tollgate/config.json, killing the
+# module ("is a directory"). Dockerfile.tollgate now bakes ./configs in and
+# lab-entrypoint.sh installs the pair each service names in LAB_CONFIG /
+# LAB_LEASES. Consequence for humans: changing a file under ./configs needs
+# `docker compose up -d --build` (or `docker compose build upstream`) to take
+# effect — the same rule the code already had.
 name: ${COMPOSE_PROJECT_NAME:-cloud-lab}
 
 # All containers are on a single Docker bridge network with static IPs so
@@ -132,15 +143,13 @@ services:
         condition: service_healthy
     environment:
       - TOLLGATE_TEST_CONFIG_DIR=/etc/tollgate
+      - LAB_CONFIG=upstream-config.json
+      - LAB_LEASES=dhcp.leases
       # The limiter is per client IP (10/min default) and every suite in
       # this lab pays from one client-container IP; the combined default
       # run (smoke + swap fees + rotation boundaries) needs ~20 payments
       # inside a minute and was 429ing mid-suite.
       - TOLLGATE_RATE_LIMIT_RPM=600
-    volumes:
-      - ./configs/upstream-config.json:/etc/tollgate/config.json
-      - ./configs/install.json:/etc/tollgate/install.json
-      - ./configs/dhcp.leases:/tmp/dhcp.leases
     ports:
       - "2121:2121"
     networks:
@@ -169,11 +178,9 @@ services:
         condition: service_healthy
     environment:
       - TOLLGATE_TEST_CONFIG_DIR=/etc/tollgate
+      - LAB_CONFIG=upstream-ext-config.json
+      - LAB_LEASES=dhcp.leases
       - TOLLGATE_RATE_LIMIT_RPM=600
-    volumes:
-      - ./configs/upstream-ext-config.json:/etc/tollgate/config.json
-      - ./configs/install.json:/etc/tollgate/install.json
-      - ./configs/dhcp.leases:/tmp/dhcp.leases
     ports:
       - "21214:2121"
     networks:
@@ -199,10 +206,8 @@ services:
         condition: service_healthy
     environment:
       - TOLLGATE_TEST_CONFIG_DIR=/etc/tollgate
-    volumes:
-      - ./configs/reseller-config.json:/etc/tollgate/config.json
-      - ./configs/install.json:/etc/tollgate/install.json
-      - ./configs/dhcp.leases:/tmp/dhcp.leases
+      - LAB_CONFIG=reseller-config.json
+      - LAB_LEASES=dhcp.leases
     ports:
       - "2122:2121"
     networks:
@@ -222,6 +227,12 @@ services:
         condition: service_healthy
       upstream:
         condition: service_healthy
+    # /tests is a bind mount of this directory (the test code). Unlike a config
+    # FILE bind, a missing bind source here is harmless — docker creates an
+    # empty directory — but the daemon still has to be able to see the content.
+    # When it cannot (act job -> host daemon), stage it first:
+    #   bash stage-checkout.sh client
+    # scripts/regression-lane.sh --lane cloud-lab does that for you.
     volumes:
       - .:/tests
     working_dir: /tests

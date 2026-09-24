@@ -64,6 +64,10 @@ settle_probe() {
 echo "== Phase A: active keyset @ 100 ppk, mint proofs on it"
 export MINT_ROTATE_ROTATIONS="$PHASE_A_ROTATIONS"
 "${COMPOSE[@]}" up -d --build mint upstream mint-rotate mint-fees >/dev/null
+
+# The client bind-mounts this directory at /tests; a bind source is resolved by
+# the docker daemon, so make the tests visible to it first (no-op locally).
+bash "$SCRIPT_DIR/stage-checkout.sh"
 settle_probe
 ROTATION_LANE=1 "${COMPOSE[@]}" run --rm -e ROTATION_LANE --entrypoint sh client \
     -c 'rm -rf /tests/__pycache__ && cd /tests && python3 -m pytest -sv test_keyset_rotation.py -k phase_a'

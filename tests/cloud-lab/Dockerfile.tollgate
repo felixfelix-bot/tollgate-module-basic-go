@@ -28,14 +28,29 @@ COPY --from=builder /tollgate /usr/local/bin/tollgate
 COPY tests/cloud-lab/fake-ndsctl.sh /usr/local/bin/ndsctl
 RUN chmod +x /usr/local/bin/ndsctl
 
-# Config files are mounted via docker-compose volumes
-# /etc/tollgate/config.json
-# /etc/tollgate/identities.json
-# /etc/tollgate/install.json
+# Lab inputs are BAKED IN, not bind-mounted.
+#
+# A bind source is resolved by the DOCKER DAEMON; a build context travels with
+# the build request. The compose files used to mount
+# `./configs/upstream-config.json:/etc/tollgate/config.json`, which works on a
+# laptop (client and daemon share a filesystem) and fails in an act job that
+# reaches the host daemon — docker created an empty DIRECTORY at
+# /etc/tollgate/config.json and the module refused to boot
+# ("failed to ensure default config: read /etc/tollgate/config.json: is a
+# directory", ngit CI cloud-lab job, 2026-09-24). Baking the same tracked files
+# in means the container is built from the commit under test and runs wherever
+# the daemon happens to be.
+COPY tests/cloud-lab/configs /opt/lab-configs
+COPY tests/cloud-lab/lab-entrypoint.sh /usr/local/bin/lab-entrypoint
+RUN chmod +x /usr/local/bin/lab-entrypoint
 
 # Create the config directory
 RUN mkdir -p /etc/tollgate
 
 EXPOSE 2121
 
+# Install the selected lab config (LAB_CONFIG / LAB_LEASES, both defaulting to
+# the base lab's upstream pair) at /etc/tollgate and /tmp/dhcp.leases, then
+# exec. See lab-entrypoint.sh.
+ENTRYPOINT ["/usr/local/bin/lab-entrypoint"]
 CMD ["tollgate"]

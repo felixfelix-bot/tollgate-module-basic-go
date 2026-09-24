@@ -92,6 +92,9 @@ if ! $FULL --profile two-router up -d --build >>"$RESLOG" 2>&1; then
     bad "compose up failed (see $RESLOG)"
     exit 1
 fi
+# The client bind-mounts this directory at /tests; a bind source is resolved by
+# the docker daemon, so make the tests visible to it first (no-op locally).
+bash stage-checkout.sh >>"$RESLOG" 2>&1 || bad "could not make tests/cloud-lab visible to the docker daemon"
 for i in $(seq 1 60); do
     m=$(curl -sf "http://127.0.0.1:${E2E_MINT_PORT:-8085}/v1/keys" >/dev/null 2>&1 && echo ok || true)
     u=$(docker exec "$UPSTREAM" curl -sf http://localhost:2121/ >/dev/null 2>&1 && echo ok || true)

@@ -29,6 +29,10 @@ trap cleanup EXIT
 echo "== Bringing up mint + upstream-ext (accepted_mints includes testnut)"
 docker compose --profile external-mints up -d --build mint upstream-ext >/dev/null
 
+# The client bind-mounts this directory at /tests; a bind source is resolved by
+# the docker daemon, so make the tests visible to it first (no-op locally).
+bash "$SCRIPT_DIR/stage-checkout.sh"
+
 echo "== External-mint suite (testnut.cashu.exchange, nutshell main + FakeWallet)"
 EXTERNAL_MINTS=1 UPSTREAM_URL=http://upstream-ext:2121 \
     docker compose --profile external-mints run --rm \
