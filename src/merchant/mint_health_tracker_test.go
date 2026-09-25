@@ -1,9 +1,10 @@
 package merchant
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +41,14 @@ func newTestTracker(config *config_manager.Config, client *http.Client) *MintHea
 	return t
 }
 
+// writeKeysetsOK writes a minimal valid NUT-01 /v1/keysets body so the health
+// probe (which validates keysets, not just HTTP status) sees a usable mint.
+func writeKeysetsOK(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"keysets":[{"id":"00ad268c4d1f5826","unit":"sat","active":true}]}`))
+}
+
 // --- Unit Tests ---
 
 func TestIsReachable_InitiallyFalse(t *testing.T) {
@@ -60,15 +69,15 @@ func TestIsReachable_UnknownMint(t *testing.T) {
 
 func TestRunInitialProbe_AllReachable(t *testing.T) {
 	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/info" {
-			w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/v1/keysets" {
+			writeKeysetsOK(w)
 		}
 	}))
 	defer srvA.Close()
 
 	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/info" {
-			w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/v1/keysets" {
+			writeKeysetsOK(w)
 		}
 	}))
 	defer srvB.Close()
@@ -94,13 +103,13 @@ func TestRunInitialProbe_NoneReachable(t *testing.T) {
 	tracker.RunInitialProbe()
 
 	if tracker.IsReachable(srv.URL) {
-		t.Error("expected mint to be unreachable when /v1/info returns 503")
+		t.Error("expected mint to be unreachable when /v1/keysets returns 503")
 	}
 }
 
 func TestRunInitialProbe_MixedReachability(t *testing.T) {
 	srvOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srvOK.Close()
 
@@ -131,7 +140,7 @@ func TestRunInitialProbe_ServerRefusesConnection(t *testing.T) {
 
 func TestMarkUnreachable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -149,9 +158,57 @@ func TestMarkUnreachable(t *testing.T) {
 	}
 }
 
+// TestMarkUnreachable_FiresSetChangedCallback pins #401: a payment failure
+// during a mint outage must not silently zero the reachable count — the
+// reachable-set callback has to fire so the degraded-mode transition is not
+// suppressed for the rest of the outage (with traffic present, the probe
+// path's setChanged comparison runs against the already-zeroed count).
+func TestMarkUnreachable_FiresSetChangedCallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeKeysetsOK(w)
+	}))
+	defer srv.Close()
+
+	tracker := newTestTracker(mintConfigWithURLs(srv.URL), nil)
+	tracker.RunInitialProbe()
+	if !tracker.IsReachable(srv.URL) {
+		t.Fatal("precondition: mint reachable after initial probe")
+	}
+
+	fired := make(chan struct{}, 1)
+	tracker.SetOnReachableSetChanged(func() { fired <- struct{}{} })
+
+	// A payment against the now-dead mint fails and calls MarkUnreachable.
+	srv.Close()
+	tracker.MarkUnreachable(srv.URL)
+
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MarkUnreachable on a reachable mint did not fire onReachableSetChanged — degraded-mode transition would be suppressed (#401)")
+	}
+}
+
+// TestMarkUnreachable_UnknownMint_DoesNotFireSetChanged: marking a mint that
+// was never reachable must not fire the callback — the set did not change.
+func TestMarkUnreachable_UnknownMint_DoesNotFireSetChanged(t *testing.T) {
+	tracker := newTestTracker(mintConfigWithURLs("https://never-reachable.test"), nil)
+
+	fired := make(chan struct{}, 1)
+	tracker.SetOnReachableSetChanged(func() { fired <- struct{}{} })
+
+	tracker.MarkUnreachable("https://never-reachable.test")
+
+	select {
+	case <-fired:
+		t.Fatal("MarkUnreachable on an already-unreachable mint fired onReachableSetChanged")
+	default:
+	}
+}
+
 func TestMarkUnreachable_ResetsConsecutiveSuccesses(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -179,7 +236,7 @@ func TestMarkUnreachable_UnknownMint_NoPanic(t *testing.T) {
 
 func TestProactiveCheck_RecoveryRequiresThreeConsecutiveSuccesses(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -208,7 +265,7 @@ func TestProactiveCheck_RecoveryRequiresThreeConsecutiveSuccesses(t *testing.T) 
 
 func TestProactiveCheck_FailedProbeResetsConsecutiveCounter(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -251,7 +308,7 @@ func TestProactiveCheck_FailedProbeResetsConsecutiveCounter(t *testing.T) {
 
 func TestProactiveCheck_RemovesPreviouslyReachableMint(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -284,7 +341,7 @@ func TestProactiveCheck_FlapDoesNotRecoverMint(t *testing.T) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -348,7 +405,7 @@ func TestGetReachableMintConfigs_Empty(t *testing.T) {
 
 func TestGetReachableMintConfigs_OnlyReachable(t *testing.T) {
 	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srvA.Close()
 
@@ -382,17 +439,15 @@ func TestGetReachableMintConfigs_NilConfig(t *testing.T) {
 
 func TestEndToEnd_FullLifecycle(t *testing.T) {
 	mintA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/info" {
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]string{"name": "mint-a"})
+		if r.URL.Path == "/v1/keysets" {
+			writeKeysetsOK(w)
 		}
 	}))
 	defer mintA.Close()
 
 	mintB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/info" {
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]string{"name": "mint-b"})
+		if r.URL.Path == "/v1/keysets" {
+			writeKeysetsOK(w)
 		}
 	}))
 	defer mintB.Close()
@@ -512,7 +567,7 @@ func TestEndToEnd_MintGoesDownThenRecoversWithInterruption(t *testing.T) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -609,7 +664,7 @@ func TestEndToEnd_MintGoesDownThenRecoversWithInterruption(t *testing.T) {
 
 func TestConcurrentAccess(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -650,7 +705,7 @@ func TestConcurrentAccess(t *testing.T) {
 
 func TestOnReachableSetChanged_FiredWhenMintGoesDown(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -668,7 +723,13 @@ func TestOnReachableSetChanged_FiredWhenMintGoesDown(t *testing.T) {
 
 	srv.Close()
 
-	tracker.RunProactiveCheck()
+	// A mint now leaves the reachable set only after defaultFailureThreshold
+	// consecutive failed probes: one bad probe — or one 429 from a busy mint —
+	// must not downgrade the merchant and stop every sale (the /ln-invoice
+	// backpressure change). The assertion below is unchanged.
+	for i := uint8(0); i < defaultFailureThreshold; i++ {
+		tracker.RunProactiveCheck()
+	}
 
 	select {
 	case <-callbackCalled:
@@ -679,7 +740,7 @@ func TestOnReachableSetChanged_FiredWhenMintGoesDown(t *testing.T) {
 
 func TestOnReachableSetChanged_FiredWhenMintRecovers(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -699,8 +760,8 @@ func TestOnReachableSetChanged_FiredWhenMintRecovers(t *testing.T) {
 	tracker.RunProactiveCheck()
 
 	_ = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/info" {
-			w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/v1/keysets" {
+			writeKeysetsOK(w)
 		}
 	}))
 
@@ -717,7 +778,7 @@ func TestOnReachableSetChanged_FiredWhenMintRecovers(t *testing.T) {
 
 func TestOnReachableSetChanged_NotFiredWhenSetUnchanged(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -740,12 +801,12 @@ func TestOnReachableSetChanged_NotFiredWhenSetUnchanged(t *testing.T) {
 
 func TestOnReachableSetChanged_MultipleMintsOneGoesDown(t *testing.T) {
 	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srvA.Close()
 
 	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srvB.Close()
 
@@ -763,7 +824,11 @@ func TestOnReachableSetChanged_MultipleMintsOneGoesDown(t *testing.T) {
 
 	srvB.Close()
 
-	tracker.RunProactiveCheck()
+	// Same as above: the failure side needs defaultFailureThreshold consecutive
+	// failures before the set changes, so the callback fires on the last one.
+	for i := uint8(0); i < defaultFailureThreshold; i++ {
+		tracker.RunProactiveCheck()
+	}
 
 	select {
 	case <-callbackCalled:
@@ -781,7 +846,7 @@ func TestOnReachableSetChanged_MultipleMintsOneGoesDown(t *testing.T) {
 
 func TestOnReachableSetChanged_NilCallback(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -796,7 +861,7 @@ func TestOnReachableSetChanged_NilCallback(t *testing.T) {
 
 func TestSetOnReachableSetChanged_OverwriteCallback(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		writeKeysetsOK(w)
 	}))
 	defer srv.Close()
 
@@ -818,7 +883,12 @@ func TestSetOnReachableSetChanged_OverwriteCallback(t *testing.T) {
 	})
 
 	srv.Close()
-	tracker.RunProactiveCheck()
+	// The failure side now needs defaultFailureThreshold consecutive failures
+	// before the set changes (a single bad probe must not downgrade the
+	// merchant); see the /ln-invoice backpressure change.
+	for i := uint8(0); i < defaultFailureThreshold; i++ {
+		tracker.RunProactiveCheck()
+	}
 
 	select {
 	case <-secondCalled:
@@ -833,15 +903,15 @@ func TestSetOnReachableSetChanged_OverwriteCallback(t *testing.T) {
 
 func TestRunInitialProbe_SetsReachableCount(t *testing.T) {
 	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/info" {
-			w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/v1/keysets" {
+			writeKeysetsOK(w)
 		}
 	}))
 	defer srvA.Close()
 
 	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/info" {
-			w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/v1/keysets" {
+			writeKeysetsOK(w)
 		}
 	}))
 	defer srvB.Close()
@@ -860,8 +930,8 @@ func TestRunInitialProbe_SetsReachableCount(t *testing.T) {
 
 func TestRunInitialProbe_PartialReachable_SetsCorrectCount(t *testing.T) {
 	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/info" {
-			w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/v1/keysets" {
+			writeKeysetsOK(w)
 		}
 	}))
 	defer srvA.Close()
@@ -877,4 +947,77 @@ func TestRunInitialProbe_PartialReachable_SetsCorrectCount(t *testing.T) {
 	if count != 1 {
 		t.Errorf("expected reachableCount=1, got %d", count)
 	}
+}
+
+// TestArmAggressiveRetry_RecoversWithinSeconds pins #429: after a runtime
+// downgrade (healthy start, mint blip, degraded re-registration), arming the
+// aggressive loop must fire the first-reachable callback within the
+// aggressive interval — not wait for the 5-minute proactive cycle.
+func TestArmAggressiveRetry_RecoversWithinSeconds(t *testing.T) {
+
+	var healthy atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/keysets" && healthy.Load() {
+			writeKeysetsOK(w)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	tracker := newTestTracker(mintConfigWithURLs(srv.URL), nil)
+	// Short per-instance aggressive timings, set before any loop starts:
+	// no package-level mutable state, nothing to restore, no race window.
+	tracker.aggressiveInterval = 30 * time.Millisecond
+	tracker.aggressiveTimeout = 500 * time.Millisecond
+	tracker.aggressiveWindow = 30 * time.Second
+
+	// Healthy start: probe reaches, proactive checks run (no aggressive —
+	// reachableCount > 0).
+	healthy.Store(true)
+	tracker.RunInitialProbe()
+	if !tracker.IsReachable(srv.URL) {
+		t.Fatal("setup: mint should be reachable after initial probe")
+	}
+	tracker.StartProactiveChecks()
+	defer tracker.Stop()
+
+	// Mint blip: mint goes away, the proactive check marks it unreachable,
+	// and the downgrade path re-registers the degraded trigger (this resets
+	// hadReachableMint, exactly as WireRecoveryTrigger does).
+	healthy.Store(false)
+	// defaultFailureThreshold consecutive failures are now needed to leave the
+	// reachable set (a single bad probe must not downgrade the merchant).
+	for i := uint8(0); i < defaultFailureThreshold; i++ {
+		tracker.RunProactiveCheck()
+	}
+	if tracker.IsReachable(srv.URL) {
+		t.Fatal("setup: mint should be unreachable after the blip")
+	}
+	fired := make(chan struct{})
+	var once sync.Once
+	tracker.SetOnFirstReachableForDegraded(func() {
+		once.Do(func() { close(fired) })
+	})
+
+	// Mint returns; WITHOUT arming, nothing fires within the shortened
+	// proactive interval.
+	healthy.Store(true)
+	select {
+	case <-fired:
+		t.Fatal("recovery fired without arming — the test no longer discriminates")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Arm (#429): recovery must arrive within the aggressive interval.
+	tracker.ArmAggressiveRetry()
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("aggressive retry did not fire first-reachable within 2s of arming")
+	}
+
+	// Idempotence: arming again while a loop is winding down must not
+	// panic or double-fire (the once-guard above asserts single fire).
+	tracker.ArmAggressiveRetry()
 }
