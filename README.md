@@ -80,6 +80,11 @@ is generated from
   (reseller mode).
 - Per-mint pricing, trust allow/blocklists, configurable session
   increments and renewal thresholds.
+- No accounts and no user identifiers: a customer is identified by the MAC
+  address their device uses, always resolved from the request's socket and
+  never from a value the client sends, and an address whose client left is
+  deauthorised instead of staying open ([what that means for a customer who
+  changes their address](docs/operator-guide.md#client-identity-mac-addresses-and-what-changing-one-does)).
 
 ## Modules
 
@@ -122,11 +127,11 @@ OpenWrt SDK, and can produce either `apk` or `ipk` artifacts.
 ## Configuration
 
 TollGate writes a default `/etc/tollgate/config.json` on first boot.
-The current schema version is **`v0.0.7`**. An abridged example:
+The current schema version is **`v0.0.8`**. An abridged example:
 
 ```json
 {
-  "config_version": "v0.0.7",
+  "config_version": "v0.0.8",
   "log_level": "info",
   "metric": "bytes",
   "step_size": 22020096,
@@ -170,9 +175,9 @@ The current schema version is **`v0.0.7`**. An abridged example:
     },
     "sessions": {
       "preferred_session_increments_milliseconds": 60000,
-      "preferred_session_increments_bytes": 131100000,
+      "preferred_session_increments_bytes": 2500000000,
       "millisecond_renewal_offset": 10000,
-      "bytes_renewal_offset": 131100000
+      "bytes_renewal_offset": 1225000000
     },
     "usage_tracking": {
       "data_monitoring_interval": "500ms"
@@ -231,7 +236,7 @@ See [tests/README.md](tests/README.md) for how to wire up the test fleet.
 
 Design and protocol docs live under [docs/](docs/):
 
-- [docs/operator-guide.md](docs/operator-guide.md) — practical CLI reference for router operators
+- [docs/operator-guide.md](docs/operator-guide.md) — practical CLI reference for router operators, including [client identity, MAC addresses, and what changing one does](docs/operator-guide.md#client-identity-mac-addresses-and-what-changing-one-does)
 - [docs/rc-tester-guide.md](docs/rc-tester-guide.md) — install/upgrade/rollback/report guide for the alpha release candidate
 - [docs/tester-intake.md](docs/tester-intake.md) — the single intake channel, the report template, and the triage/severity rules for alpha testers
 - [docs/merchant.md](docs/merchant.md)

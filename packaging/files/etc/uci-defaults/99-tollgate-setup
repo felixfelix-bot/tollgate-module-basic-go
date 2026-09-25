@@ -1,10 +1,21 @@
 #!/bin/sh
 # TollGate first-boot configuration. Runs once from /etc/init.d/boot before
-# services start. All UCI changes are committed in a single pass at the end;
-# no service restarts here (uci-defaults runs before procd brings services up).
+# services start, and from the package postinst on every install/upgrade. All
+# UCI changes are committed in a single pass at the end.
+#
+# No service is restarted on the first-boot path (uci-defaults runs before procd
+# brings services up, and procd then starts them once from the config written
+# here). The ONE exception is converge_nodogsplash_runtime: when this script runs
+# on an ALREADY-RUNNING system and the nodogsplash pre-auth allow list no longer
+# matches the ruleset the live process installed, that process is reloaded — a
+# config change is otherwise not delivered until something restarts it, which is
+# right on a fresh boot and wrong on an upgrade of a running router.
 #
 # The flag file stores the setup version. On reinstall/upgrade:
-# - Same version → verify wireless APs only (belt-and-suspenders)
+# - Same version → verify wireless APs, re-assert the uhttpd contract and the
+#   nodogsplash pre-auth allow list (uhttpd.main/uhttpd.portal drift and a
+#   stale users_to_router list are repaired; the rest is not re-run), then
+#   converge the running ruleset on the repaired list
 # - New version or first boot → full setup
 
 SETUP_FLAG="/etc/tollgate-setup-done"
@@ -16,17 +27,57 @@ SETUP_FLAG="/etc/tollgate-setup-done"
 # leaves the placeholder in place, so fall back to the version the package
 # manager recorded for this package rather than writing a bogus marker.
 SETUP_VERSION="__TOLLGATE_VERSION__"
+# The placeholder reference below is CONCATENATED so the packaging's global
+# __TOLLGATE_VERSION__ substitution cannot rewrite it (#459): a substituted
+# pattern (*v0.6.0-alpha3*) self-matched the already-substituted assignment
+# above, forced every run into this resolve branch, and on apk systems
+# (no /usr/lib/opkg/status) pinned SETUP_VERSION to "unsubstituted" forever —
+# full setup never re-ran after the first boot.
+PLACEHOLDER="__TOLLGATE""_VERSION__"
 case "$SETUP_VERSION" in
-    *__TOLLGATE_VERSION__*)
+    "$PLACEHOLDER")
+        # Source run or an unsubstituted script: resolve the real version
+        # from whichever package manager owns this system.
         SETUP_VERSION=$(sed -n '/^Package: tollgate-wrt$/,/^$/s/^Version: //p' /usr/lib/opkg/status 2>/dev/null | head -n1)
+        if [ -z "$SETUP_VERSION" ] && command -v apk >/dev/null 2>&1; then
+            SETUP_VERSION=$(apk list --installed 2>/dev/null | sed -n 's/^tollgate-wrt-\([^ ]*\).*/\1/p' | head -n1)
+        fi
         [ -n "$SETUP_VERSION" ] || SETUP_VERSION="unsubstituted"
         ;;
 esac
 
 LOGFILE=/tmp/tollgate-setup.log
+# The nodogsplash init script, as an absolute path next to SETUP_FLAG and
+# LOGFILE so the offline tests can redirect all three the same way
+# (tests/uci-defaults-*_test.sh).
+NDS_INIT="/etc/init.d/nodogsplash"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOGFILE"; }
 
 # -- setup steps ------------------------------------------------------------
+
+# load_brand: whitelabel selector — 'tollgate' (default) or 'net4sats'. The
+# two brands differ only in naming; the brand file is written by whitelabel
+# installers before first boot, and everything derived from it — system
+# hostname (and thus <hostname>.lan DNS), AP SSIDs, NDS gateway name —
+# follows this single selector.
+#
+# Called AFTER the log truncation in both the short and full paths: anything
+# logged before `: > "$LOGFILE"` is wiped, which silently ate the
+# coercion line when this ran at the top of the script.
+#
+# read -r strips the trailing newline and leading/trailing IFS whitespace
+# (verified on BusyBox ash). Do NOT use `tr -d '[:space:]'` here: BusyBox tr
+# treats the character class as a literal set and deletes every s/p/a/c/e
+# from the value — "net4sats" became "nt4t" and coerced to the default.
+load_brand() {
+    read -r BRAND < /etc/tollgate/brand 2>/dev/null || BRAND=""
+    case "$BRAND" in
+        net4sats) BRAND_HOSTNAME="Net4sats" ;;
+        *) BRAND_HOSTNAME="TollGate"
+           [ -n "$BRAND" ] && log "Brand '${BRAND}' not recognized — coercing to default 'tollgate' (expected: net4sats)"
+           ;;
+    esac
+}
 
 setup_uhttpd() {
     uci -q get uhttpd.main >/dev/null 2>&1 || uci set uhttpd.main=uhttpd
@@ -44,7 +95,19 @@ setup_uhttpd() {
         uci set uhttpd.main.cert='/etc/uhttpd.crt'
         uci set uhttpd.main.key='/etc/uhttpd.key'
     fi
-    uci set uhttpd.main.redirect_https='0'
+    # uhttpd.main.redirect_https is a DERIVED value, not a configured one:
+    # LuCI's :8080 is redirected to the TLS listener only when that listener is
+    # real. The feed's 92-tollgate-admin-setup computes the same rule (readable,
+    # non-empty cert/key pair AND a configured listen_https) because both scripts
+    # write this option and install order decides which lands last - the two must
+    # agree, and a router that lost its certs must never keep a stale redirect to
+    # a dead :443 (the 2026-09-21 pre13 LuCI lockout).
+    if [ -r /etc/uhttpd.crt ] && [ -s /etc/uhttpd.crt ] &&
+       [ -r /etc/uhttpd.key ] && [ -s /etc/uhttpd.key ]; then
+        uci set uhttpd.main.redirect_https='1'
+    else
+        uci set uhttpd.main.redirect_https='0'
+    fi
     uci set uhttpd.main.home='/www'
     uci set uhttpd.main.rfc1918_filter='1'
     uci set uhttpd.main.max_requests='3'
@@ -74,6 +137,196 @@ setup_uhttpd_portal() {
     uci set uhttpd.portal.no_dirlists='1'
 }
 
+# Remove stray :8090 entries from uhttpd.main's listen list.
+#
+# uhttpd.main's docroot is /www, and LuCI's /www/index.html meta-refreshes
+# to cgi-bin/luci — so ANY port added to uhttpd.main serves "redirect to
+# LuCI". Repair attempts that add 8090 there (instead of creating the
+# dedicated configUI section below) produce exactly the reported
+# ":8090 redirects to LuCI instead of the configUI" symptom. Runs in both
+# setup paths so the misconfiguration cannot survive a reinstall.
+sanitize_uhttpd_main_configui_port() {
+    uci -q del_list uhttpd.main.listen_http='0.0.0.0:8090'
+    uci -q del_list uhttpd.main.listen_http='[::]:8090'
+}
+
+# Whitelabel config UI on :8090 (net4sats brand).
+#
+# The whitelabel admin/config UI lives in /www/net4sats — installed by the
+# whitelabel installer, never shipped by this package — and is served by a
+# DEDICATED uhttpd section, never by uhttpd.main (see
+# sanitize_uhttpd_main_configui_port). Mirrors the known-good deployed
+# layout exactly so upgrades of already-configured routers converge
+# instead of duplicating sections. Only created when the branded docroot
+# actually exists; stock tollgate routers get nothing on :8090.
+#
+# Deliberately NOT added to nodogsplash users_to_router: the config UI is
+# owner-facing and reached over the private network (br-private, not
+# NDS-gated). Pre-auth public-SSID guests must not reach an admin UI.
+setup_uhttpd_configui() {
+    # Self-contained brand check: read /etc/tollgate/brand directly (written
+    # by whitelabel installers) so this repair works regardless of whether
+    # the surrounding script defines a BRAND variable.
+    local cfgui_brand
+    # read (not `tr -d '[:space:]'`): busybox tr on some OpenWrt builds
+    # lacks character classes and would delete the literal chars
+    # [ : s p a c e — mangling "net4sats" into "nt4t". POSIX read strips
+    # leading/trailing IFS whitespace and the trailing newline itself.
+    read -r cfgui_brand < /etc/tollgate/brand || cfgui_brand=""
+    [ "$cfgui_brand" = "net4sats" ] || return 0
+    [ -d /www/net4sats ] || return 0
+
+    uci -q get uhttpd.net4sats >/dev/null 2>&1 || uci set uhttpd.net4sats=uhttpd
+    local cfgui_listen
+    cfgui_listen=$(uci -q get uhttpd.net4sats.listen_http 2>/dev/null || echo "")
+    if ! echo "$cfgui_listen" | grep -q "0.0.0.0:8090"; then
+        uci add_list uhttpd.net4sats.listen_http='0.0.0.0:8090'
+    fi
+    if ! echo "$cfgui_listen" | grep -q "\[::\]:8090"; then
+        uci add_list uhttpd.net4sats.listen_http='[::]:8090'
+    fi
+    uci set uhttpd.net4sats.home='/www/net4sats'
+    uci set uhttpd.net4sats.ubus_prefix='/ubus'
+    uci set uhttpd.net4sats.script_timeout='60'
+    uci set uhttpd.net4sats.network_timeout='30'
+    uci set uhttpd.net4sats.max_requests='3'
+    uci set uhttpd.net4sats.tcp_keepalive='1'
+    log "Whitelabel configUI uhttpd section ensured on :8090 (home=/www/net4sats)"
+}
+
+# -- admin credential gate ---------------------------------------------------
+#
+# The owner-facing admin board is served by the portal-staged
+# 92-tollgate-admin-setup on :8090 (opt-in :8443) and its only login endpoint is
+# rpcd's session.login. The distribution's /etc/config/rpcd maps that login's
+# password to root's shadow hash (`password '$p$root'` ->
+# getspnam("root")->sp_pwdp) and rpcd's rpc_login_test_password() begins with
+# `if (!hash || !*hash) return true;` — an EMPTY hash authenticates ANY
+# password, including the empty string. A stock first-boot rootfs is exactly
+# that state, and the session it hands out reaches the board's ACL
+# (`file:["exec"]`, `system:["password_set"]`, `tollgate wallet_drain_cashu`):
+# root command execution, a root password change, or the operator's money, with
+# no credential at all. Reachability is a separate half (the pre-auth
+# allowance and the captive-bridge drop); this is the credential half.
+#
+# So the admin path FAILS CLOSED: a credential is established when there is
+# none (and shown to the operator exactly once), and when no credential can be
+# established or verified the admin listeners are dropped instead of being
+# served behind an empty hash.
+#
+# The two credential sources are absolute paths into the live system; the
+# offline tests redirect them in their copy of this script, exactly as they
+# redirect SETUP_FLAG and LOGFILE above.
+SHADOW_FILE="${SHADOW_FILE:-/etc/shadow}"
+PASSWD_FILE="${PASSWD_FILE:-/etc/passwd}"
+
+# rpcd's password hash for `root`. /etc/shadow wins whenever it exists: an
+# EMPTY field there is the stock first-boot state and the whole hazard, so
+# falling back to /etc/passwd's `x` placeholder would misread it as a set
+# credential.
+admin_root_hash() {
+    if [ -f "$SHADOW_FILE" ]; then
+        awk -F: '$1 == "root" { print $2; exit }' "$SHADOW_FILE" 2>/dev/null
+    elif [ -f "$PASSWD_FILE" ]; then
+        awk -F: '$1 == "root" { print $2; exit }' "$PASSWD_FILE" 2>/dev/null
+    fi
+}
+
+# Prints one of: set | empty | locked | unknown.
+# `locked` (`!`/`*`) is not a credential-less state: password login is refused
+# outright, so the board cannot be opened with any password, and re-enabling
+# password auth on a deliberately locked account would be the regression.
+admin_credential_state() {
+    if [ ! -f "$SHADOW_FILE" ] && [ ! -f "$PASSWD_FILE" ]; then
+        printf 'unknown'
+        return 0
+    fi
+    case "$(admin_root_hash)" in
+        "") printf 'empty' ;;
+        '!'*|'*'*) printf 'locked' ;;
+        *) printf 'set' ;;
+    esac
+}
+
+# 20 characters from a 32-character alphabet — no l/o/0/1 look-alikes and
+# nothing a shell or a password prompt would eat — read straight from the
+# kernel CSPRNG. 256 is an exact multiple of 32, so the byte->character
+# mapping is uniform.
+generate_admin_password() {
+    local alphabet="abcdefghijkmnpqrstuvwxyz23456789"  # pragma: allowlist secret
+    od -An -N 20 -tu1 /dev/urandom | awk -v a="$alphabet" \
+        '{ for (i = 1; i <= NF; i++) printf "%s", substr(a, ($i % 32) + 1, 1) }'
+}
+
+# BusyBox `passwd` reading the new password twice from stdin is the
+# dependency-free path OpenWrt always ships, and the value never reaches argv.
+set_admin_password() {
+    printf '%s\n%s\n' "$1" "$1" | passwd root >/dev/null 2>&1
+}
+
+# Drop every admin-board listener this package can own or repair. uhttpd.admin
+# is the portal-staged :8090/:8443 instance, uhttpd.net4sats this package's own
+# whitelabel configUI on the same port, and uhttpd.main is repaired because a
+# stray :8090 entry there has survived reinstalls before. Nothing else is
+# touched: LuCI (:80/:8080), the portal (:2050/:2051) and the backend (:2121)
+# are not admin surfaces.
+drop_admin_listeners() {
+    uci -q del_list uhttpd.admin.listen_http='0.0.0.0:8090'
+    uci -q del_list uhttpd.admin.listen_http='[::]:8090'
+    uci -q del_list uhttpd.admin.listen_https='0.0.0.0:8443'
+    uci -q del_list uhttpd.admin.listen_https='[::]:8443'
+    uci -q del_list uhttpd.net4sats.listen_http='0.0.0.0:8090'
+    uci -q del_list uhttpd.net4sats.listen_http='[::]:8090'
+    sanitize_uhttpd_main_configui_port
+}
+
+# Runs in BOTH setup paths: the board is enabled by the install pass, and a
+# reinstall/upgrade must not leave an empty hash behind it either.
+#   set    -> nothing to do, the board is authenticatable
+#   locked -> nothing to do, password login is refused
+#   empty  -> generate a credential, apply it, and PROVE it by re-reading the
+#             hash; the value is shown once (install output + root-only log,
+#             the same channel as the generated private WiFi key)
+#   empty-but-unprovable / unknown -> refuse to serve the board at all
+enforce_admin_credential() {
+    local state password
+    state=$(admin_credential_state)
+    case "$state" in
+        set)
+            log "Admin credential verified (root password set) — :8090 admin board allowed"
+            return 0
+            ;;
+        locked)
+            log "Root account is locked — password login is refused, :8090 admin board allowed"
+            return 0
+            ;;
+    esac
+
+    if [ "$state" = "empty" ]; then
+        password=$(generate_admin_password)
+        if [ -n "$password" ]; then
+            set_admin_password "$password"
+        fi
+        if [ -n "$password" ] && [ "$(admin_credential_state)" = "set" ]; then
+            # Shown ONCE: the install output, plus the root-only log (600, and
+            # already the home of the generated private WiFi key). It is never
+            # written to UCI — /etc/config is world-readable — and never
+            # re-displayed; the operator changes it with `passwd root`.
+            printf 'TollGate: root had no password; generated one for the :8090 admin board — shown once: %s\n' "$password"
+            log "No root password was set: generated one for the admin board (shown once, change it with 'passwd root'): $password"
+            return 0
+        fi
+        log "ERROR: no credential could be established (passwd did not take, or no entropy to generate one) — refusing to serve the :8090 admin board (rpcd would accept ANY password against the empty hash); set one with 'passwd root' and re-run this script"
+    else
+        log "ERROR: no readable root credential state ($SHADOW_FILE / $PASSWD_FILE) — refusing to serve the :8090 admin board; set one with 'passwd root' and re-run this script"
+    fi
+
+    # An unauthenticatable board is worse than no board.
+    drop_admin_listeners
+    printf 'TollGate: root has no usable password — the :8090 admin board is NOT served. Set one with `passwd root` and re-run /etc/uci-defaults/99-tollgate-setup\n' >&2
+    return 1
+}
+
 setup_dns_dnsmasq() {
     # Only override DNS if it's unset or pointing at localhost.
     local current_dns
@@ -92,10 +345,132 @@ setup_dns_dnsmasq() {
     uci set dhcp.@dnsmasq[0].expandhosts='1'
 }
 
+# -- radio band detection ----------------------------------------------------
+#
+# OpenWrt numbers radio sections by detection order, not by band: radio0 is
+# the 2.4 GHz radio on some hardware and the 5 GHz radio on other, tri-band
+# devices add a third section, and single-band devices never get a radio1.
+# Every radio assignment below therefore resolves the band first and binds
+# sections by band, never by index.
+
+wifi_device_sections() {
+    uci -q show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"
+}
+
+# Band of a wifi-device section: the 'band' option on OpenWrt 21.02+, the
+# legacy 'hwmode' option on older releases, and finally the channel number
+# (channels above 14 are 5 GHz). Prints "" when nothing identifies the band.
+radio_band() {
+    local band hwmode channel
+    band=$(uci -q get "wireless.$1.band")
+    case "$band" in
+        2g|5g|6g|60g) printf '%s' "$band"; return 0 ;;
+    esac
+    hwmode=$(uci -q get "wireless.$1.hwmode")
+    case "$hwmode" in
+        11ad|ad) printf '60g'; return 0 ;;
+        11a*|11na|a) printf '5g'; return 0 ;;
+        11b*|11g*|11ng|b|g|bg) printf '2g'; return 0 ;;
+    esac
+    channel=$(uci -q get "wireless.$1.channel")
+    case "$channel" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    if [ "$channel" -gt 14 ]; then printf '5g'; else printf '2g'; fi
+}
+
+# First wifi-device section reporting the given band.
+find_radio_by_band() {
+    local section
+    for section in $(wifi_device_sections); do
+        if [ "$(radio_band "$section")" = "$1" ]; then
+            printf '%s' "$section"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Exports: R2G, R5G (the 2.4/5 GHz wifi-device sections, possibly empty).
+# Only when NO radio reports a band do we fall back to the historical
+# radio0/radio1 literals — the last release's behavior.
+detect_band_radios() {
+    R2G=$(find_radio_by_band 2g)
+    R5G=$(find_radio_by_band 5g)
+    if [ -z "$R2G" ] && [ -z "$R5G" ]; then
+        uci -q get wireless.radio0 >/dev/null 2>&1 && R2G=radio0
+        uci -q get wireless.radio1 >/dev/null 2>&1 && R5G=radio1
+        log "No band information on radios, falling back to radio0/radio1"
+    fi
+    [ -n "$R2G" ] && log "2.4 GHz radio: $R2G"
+    [ -n "$R5G" ] && log "5 GHz radio: $R5G"
+}
+
+enable_all_radios() {
+    local section
+    for section in $(wifi_device_sections); do
+        uci set "wireless.$section.disabled=0"
+    done
+}
+
+# First adoptable AP-mode wifi-iface section on a radio (netifd names the
+# stock one default_radioN). STA sections are skipped: they hold the
+# upstream connection.
+first_ap_iface_on() {
+    local section
+    for section in $(uci -q show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.]*\)=wifi-iface$/\1/p"); do
+        [ "$(uci -q get "wireless.$section.device")" = "$1" ] || continue
+        [ "$(uci -q get "wireless.$section.mode")" = "sta" ] && continue
+        printf '%s' "$section"
+        return 0
+    done
+    return 1
+}
+
+# -- guest client isolation --------------------------------------------------
+#
+# The open guest SSID is the one layer-2 domain on the router that strangers
+# share: nothing in this writer, the portal or the installer ever set client
+# isolation, so on the shipped config one guest could ARP-scan its neighbours,
+# answer their DHCP, advertise mDNS/SSDP services to them, or relay through
+# one of them. Both guest APs (2.4 and 5 GHz) are separate BSSes, so both need
+# it — one is not enough.
+#
+# What is set: `isolate` on each guest wifi-iface (below), which hostapd turns
+# into ap_isolate=1 (lib/netifd/hostapd.sh, "if [ \"$isolate\" -gt 0 ]").
+# It is an INTRA-BSS forwarding policy, not encryption: a monitor-mode
+# neighbour still sees every frame in the clear, an authorised MAC is still
+# harvestable from 802.11 headers, and cross-BSS traffic (2.4 GHz guest to
+# 5 GHz guest) is still bridged.
+#
+# What is deliberately NOT set, and why — the wired ports that share br-lan.
+# Checked rather than guessed, on the actual target (GL-MT3000, MT7981,
+# OpenWrt 25.12.5, 2026-09-24):
+#   * The netifd syntax exists: `config device` + `option isolate '1'` is
+#     defined (netifd device.c DEV_ATTR_ISOLATE -> system-linux.c
+#     system_bridge_set_isolated() -> sysfs brport/isolated).
+#   * But Linux bridge port isolation is BILATERAL: net/bridge/br_private.h
+#     br_skb_isolated() is `src_port_isolated && (to->flags & BR_ISOLATED)`,
+#     so isolating the wired port alone blocks nothing, and the guest BSS's
+#     own bridge port (phyN-apM) cannot be marked isolated from uci at all —
+#     netifd's `wireless_isolate` only clears hairpin_mode (system-linux.c
+#     system_bridge_set_wireless()).
+#   * Measured on the bench: with brport/isolated=1 on the LAN port, alone and
+#     together with the guest VAP's port, a guest still reached a wired host —
+#     ping, ARP and TCP all passed, and the frames were captured on the wired
+#     NIC. Writing the option would therefore be a control that reports
+#     protection it does not provide, so it is left out on purpose. The wired
+#     and cross-BSS halves need a different mechanism (a dedicated br-guest
+#     with its own reject-by-default zone, or a bridge-family nft rule keyed on
+#     the VAP ports); see the PR body for the measurements.
+#
+# Never isolated here: the uplink (an STA wifi-iface, and the WAN port is not a
+# member of the guest bridge) and the owner's private SSID/bridge — the
+# operator's own devices must keep seeing each other (casting, printing).
 configure_radio_ap() {
-    local iface="$1" label="$2"
+    local iface="$1" label="$2" radio="$3"
     if ! uci -q get "wireless.$iface" >/dev/null; then
-        return
+        uci set "wireless.$iface=wifi-iface"
     fi
     local current_mode
     current_mode=$(uci -q get "wireless.$iface".mode)
@@ -103,34 +478,73 @@ configure_radio_ap() {
         log "$iface is STA, preserving upstream connection"
         return
     fi
-    uci set "wireless.$iface".name="$label"
-    uci set "wireless.$iface".mode='ap'
-    uci set "wireless.$iface".network='lan'
-    uci set "wireless.$iface".ssid="$GATEWAY_NAME"
-    uci set "wireless.$iface".encryption='none'
-    uci set "wireless.$iface".disabled='0'
+    # Rebind to the band's radio: sections adopted from an older install may
+    # sit on the wrong radio from when the script assumed radio0 is 2.4 GHz.
+    uci set "wireless.$iface.device=$radio"
+    uci set "wireless.$iface.name=$label"
+    uci set "wireless.$iface.mode=ap"
+    uci set "wireless.$iface.network=lan"
+    uci set "wireless.$iface.ssid=$GATEWAY_NAME"
+    uci set "wireless.$iface.encryption=none"
+    # Guest client isolation (ap_isolate=1): armed here so it lands on BOTH
+    # setup paths — this function is the single writer of the public APs, and
+    # the same-version reinstall path reaches it through setup_band_ap() too.
+    uci set "wireless.$iface.isolate=1"
+    uci set "wireless.$iface.disabled=0"
+}
+
+# Ensure an open TollGate AP named <label> on the given band's radio. Adopts
+# an existing section by that name (possibly on the wrong radio from an older
+# install), else the radio's own stock AP section, else creates one. When no
+# radio reports the band, any stale section is dropped instead of lingering
+# bound to a radio that cannot serve it.
+setup_band_ap() {
+    local radio="$1" label="$2" iface
+    if [ -z "$radio" ]; then
+        if uci -q get "wireless.$label" >/dev/null 2>&1; then
+            log "No radio for $label; removing stale section"
+            uci delete "wireless.$label"
+        else
+            log "No radio for $label; skipping"
+        fi
+        return 0
+    fi
+
+    if uci -q get "wireless.$label" >/dev/null 2>&1; then
+        iface="$label"
+    else
+        iface=$(first_ap_iface_on "$radio")
+        [ -z "$iface" ] && iface="$label"
+    fi
+    log "Configuring $label on $radio (section $iface)"
+    configure_radio_ap "$iface" "$label" "$radio"
 }
 
 # Exports: RANDOM_SUFFIX, GATEWAY_NAME (consumed by later steps).
 setup_public_wifi() {
     RANDOM_SUFFIX=$(hexdump -n 3 -e '4/1 "%02X"' /dev/urandom | cut -c1-4)
-    GATEWAY_NAME="TollGate-${RANDOM_SUFFIX}"
+    GATEWAY_NAME="${BRAND_HOSTNAME}-${RANDOM_SUFFIX}"
     log "Gateway name: ${GATEWAY_NAME}"
 
-    configure_radio_ap 'default_radio0' 'tollgate_2g_open'
-    configure_radio_ap 'default_radio1' 'tollgate_5g_open'
-    uci -q get wireless.radio0 >/dev/null && uci set wireless.radio0.disabled='0'
-    uci -q get wireless.radio1 >/dev/null && uci set wireless.radio1.disabled='0'
+    setup_band_ap "$R2G" 'tollgate_2g_open'
+    setup_band_ap "$R5G" 'tollgate_5g_open'
+    enable_all_radios
 }
 
 setup_hostname() {
     local current_hostname
     current_hostname=$(uci -q get system.@system[0].hostname)
-    if [ "$current_hostname" = "OpenWrt" ]; then
-        uci set system.@system[0].hostname='TollGate'
-        log "Hostname changed to TollGate (was OpenWrt default)"
+    if [ "$current_hostname" = "$BRAND_HOSTNAME" ]; then
+        log "Hostname '${current_hostname}' already matches the brand"
+    elif [ "$current_hostname" = "OpenWrt" ] || [ "$current_hostname" = "TollGate" ] || [ "$current_hostname" = "Net4sats" ]; then
+        # Fresh install (OpenWrt) or a known brand default from the other
+        # brand — migrate to this brand's hostname. Deliberately one-way
+        # and known-values-only: an operator's custom hostname is never
+        # touched (#444).
+        uci set system.@system[0].hostname="$BRAND_HOSTNAME"
+        log "Hostname changed to $BRAND_HOSTNAME (was '${current_hostname}')"
     else
-        log "Hostname '${current_hostname}' preserved (not default OpenWrt)"
+        log "Hostname '${current_hostname}' preserved (custom, not a brand default)"
     fi
     # TLS cert CN should match whatever hostname is active after the check above.
     local final_hostname
@@ -142,30 +556,119 @@ setup_hostname() {
     log "Hostname applied to running kernel: ${final_hostname}"
 }
 
-setup_nodogsplash() {
+# The ONE writer of nodogsplash's pre-auth allow list, shared by the full-setup
+# path (setup_nodogsplash, below) and the same-version path (the driver's
+# short branch): a stale or absent users_to_router list must be repaired by
+# every setup path, not only first boot. A same-version install — one whose
+# /etc/tollgate-setup-done already equals SETUP_VERSION, e.g. the pre15 round
+# over pre14 while both reported v0.6.0-alpha3 — used to verify the wireless
+# APs and re-assert the uhttpd contract and nothing else, so it kept whatever
+# allow list the previous install left behind: the pre-auth :443 rule below was
+# missing on the router and the post-install sweep came out 4/9.
+#
+# Idempotent by construction: each rule is added only when its whole entry is
+# absent, so re-running adds nothing and duplicates nothing, and a config that
+# has :8443 but not :443 gains exactly :443 (the anchored match below is what
+# keeps :8443 from satisfying the :443 check).
+assert_nodogsplash_allow_entries() {
     [ -f /etc/config/nodogsplash ] || touch /etc/config/nodogsplash
     if ! uci -q get nodogsplash.@nodogsplash[0] >/dev/null 2>&1; then
         uci add nodogsplash nodogsplash >/dev/null
     fi
-    uci set nodogsplash.@nodogsplash[0].enabled='1'
-    uci set nodogsplash.@nodogsplash[0].gatewayname="${GATEWAY_NAME} Portal"
-    uci set nodogsplash.@nodogsplash[0].gatewayinterface='br-lan'
     # Add firewall allow rules only if not already present (idempotent).
     local nds_users
     nds_users=$(uci -q get nodogsplash.@nodogsplash[0].users_to_router 2>/dev/null || echo "")
-    if ! echo "$nds_users" | grep -q "port 2121"; then
+    if ! uci_list_has_port 2121; then
         uci add_list nodogsplash.@nodogsplash[0].users_to_router='allow tcp port 2121'
     fi
-    if ! echo "$nds_users" | grep -q "port 8080"; then
+    if ! uci_list_has_port 8080; then
         uci add_list nodogsplash.@nodogsplash[0].users_to_router='allow tcp port 8080'
     fi
-    if ! echo "$nds_users" | grep -q "port 2050"; then
+    if ! uci_list_has_port 2050; then
         uci add_list nodogsplash.@nodogsplash[0].users_to_router='allow tcp port 2050'
     fi
-    if ! echo "$nds_users" | grep -q "port 2051$"; then
+    if ! uci_list_has_port 2051; then
         uci add_list nodogsplash.@nodogsplash[0].users_to_router='allow tcp port 2051'
     fi
-    uci set nodogsplash.@nodogsplash[0].gatewaydomainname='TollGate.lan'
+    # The admin board (uhttpd.admin: :8090 HTTP, opt-in :8443 HTTPS) is
+    # OWNER-facing, exactly like the whitelabel configUI in
+    # setup_uhttpd_configui above: the owner reaches it over the private
+    # network (br-private, which nodogsplash does not gate). A pre-auth guest
+    # on the open public SSID must not reach an admin UI, so :8090/:8443 are
+    # deliberately NOT part of the customer journey and are kept OUT of
+    # users_to_router — this list is nodogsplash's PRE-AUTHENTICATION allow
+    # list, and :8090 serves the board's root-capable login over plain HTTP
+    # with rpcd's /ubus session endpoint behind it, so an entry here exposes
+    # that login to sniffing and brute-force from the guest network while the
+    # credentials are still in the clear.
+    #
+    # Removed rather than merely omitted: an already-deployed router carries
+    # the two entries (an earlier build wrote them, and the feed's
+    # 92-tollgate-admin-setup still re-asserts them on every install/upgrade),
+    # so leaving them out of the writer would only fix a factory-fresh router.
+    # `del_list` here is what converges the fleet, and it is why the removal is
+    # re-asserted on both setup paths instead of living in the full-setup-only
+    # section. Kept in the shared writer so the same-version path performs it
+    # too. Failures are ignored: no entry to remove is the normal case.
+    #
+    # It converges at the NEXT BOOT, not at install time. The feed's
+    # 92-tollgate-admin-setup re-adds both entries on every install/upgrade,
+    # and postinst runs 90, 99, 92 in that order (packaging/Makefile), so on
+    # the postinst pass `92` runs AFTER this script and puts them straight
+    # back: the running config still carries `allow tcp port 8090`/`8443`
+    # until the reboot, when uci-defaults run numerically (`92` before `99`)
+    # and this `del_list` is the last writer. The effective control in the
+    # window between install and boot is the packet-filter rule in
+    # packaging/files/etc/nftables.d/31-admin-board-not-guest-reachable.nft,
+    # loaded by the `/etc/init.d/firewall reload` postinst performs after
+    # these scripts have run — it does not depend on this list being in the
+    # intended state.
+    uci -q del_list nodogsplash.@nodogsplash[0].users_to_router='allow tcp port 8090' 2>/dev/null
+    uci -q del_list nodogsplash.@nodogsplash[0].users_to_router='allow tcp port 8443' 2>/dev/null
+    # :443 belongs with :8080 above: with a cert/key pair in place
+    # uhttpd.main sets redirect_https=1 and answers the :8080 LuCI port with
+    # `307 Location: https://<router>/`, so the pre-auth client that follows
+    # the redirect needs a nodogsplash rule for :443 or it dead-ends on a port
+    # the gateway still REJECTs — the operator lockout
+    # docs/architecture/uhttpd-redirect-https-ownership-decision.md exists to
+    # prevent. (The admin board's :8443 is deliberately NOT allowed — the
+    # board is owner-facing and reached over br-private, see above.)
+    # tollgate-cli's
+    # `ssl enable` path already writes this rule for the routers that enable
+    # TLS from the CLI (src/cmd/tollgate-cli/ssl.go); first boot was the only
+    # path without it. Whole-field matching via uci_list_has_port (see #516).
+    if ! uci_list_has_port 443; then
+        uci add_list nodogsplash.@nodogsplash[0].users_to_router='allow tcp port 443'
+    fi
+}
+
+
+# uci_list_has_port P: succeeds when the users_to_router listing already
+# contains a whole `port P` field. `uci get` renders a list option either
+# one entry per line OR as a quoted single-line list ('a' 'b' ...); the
+# delimiters below cover both renderings — plain substring or
+# end-of-line matching misses the quoted form and duplicates the rule on
+# every rerun (#516).
+uci_list_has_port() {
+    printf '%s\n' "$nds_users" | grep -qE "(^|[[:space:]'])port $1([[:space:]]|'|\$)"
+}
+
+setup_nodogsplash() {
+    # The section, its pre-auth allow list and the whole-list repair live in
+    # one place so the same-version path can call exactly the same writer.
+    assert_nodogsplash_allow_entries
+    uci set nodogsplash.@nodogsplash[0].enabled='1'
+    uci set nodogsplash.@nodogsplash[0].gatewayname="${GATEWAY_NAME} Portal"
+    uci set nodogsplash.@nodogsplash[0].gatewayinterface='br-lan'
+    # gatewaydomainname deliberately NOT set — and actively deleted on
+    # upgrade: nodogsplash 5.0.2 redirects every splash request carrying
+    # a redir param back to the splash when it is configured, looping
+    # pre-auth clients (browsers abort with ERR_TOO_MANY_REDIRECTS and
+    # never reach the payment page). The friendly <hostname>.lan name
+    # keeps resolving without it: dnsmasq serves the system hostname in
+    # the 'lan' zone (domain/expandhosts/local are set in
+    # setup_dns_dnsmasq). See #428.
+    uci -q delete nodogsplash.@nodogsplash[0].gatewaydomainname
     uci set nodogsplash.@nodogsplash[0].gatewayport='2050'
     # Let the Go backend control session duration: NDS defaults to
     # 1200 s (20 min), which would deauth users mid-session regardless
@@ -187,6 +690,185 @@ setup_nodogsplash() {
     if ! echo "$nds_auth" | grep -q "192.168.0.0/16"; then
         uci add_list nodogsplash.@nodogsplash[0].authenticated_users='block to 192.168.0.0/16'
     fi
+}
+
+# --- nodogsplash runtime convergence ----------------------------------------
+#
+# users_to_router is nodogsplash's pre-authentication allow list, and
+# nodogsplash turns it into a ruleset ONCE, when the process starts: the
+# pre-auth accepts are the `ndsRTR` iptables chain it installs for the captive
+# bridge (br-lan). A change to the list therefore reaches a RUNNING router only
+# if something reloads the service.
+#
+# Nothing in the packaging path does. This script deliberately restarts no
+# service (on a FRESH BOOT it runs from /etc/init.d/boot before procd starts
+# them, and procd then starts nodogsplash once, from the config written here),
+# and the postinst that actually ships in the published package restarts only
+# tollgate-wrt (measured 2026-09-25: extracted from /lib/apk/db/scripts.tar.gz
+# on the bench). Measured consequence after the pre16 install: `uci show
+# nodogsplash` no longer listed :8090 while the RUNNING ruleset still carried
+#   -A ndsRTR -p tcp -m tcp --dport 8090 -j ACCEPT
+# so the owner-facing admin board answered HTTP 200 to a client on br-lan that
+# had paid nothing, until an operator ran `/etc/init.d/nodogsplash restart` by
+# hand (which dropped it to 000 with the portal unaffected).
+#
+# The step below makes the effective policy equal the configured one: it
+# compares the pre-auth TCP ports the config lists with the ports the RUNNING
+# ruleset actually accepts, and reloads the service when — and only when — the
+# two differ and the service is already up. A fresh boot is left alone (procd
+# starts the service once, with the new config), a steady-state run is left
+# alone (no reload storm, no dropped sessions), and the reload is logged with
+# the resulting accept-rule count so an install can be audited from
+# /tmp/tollgate-setup.log.
+
+# The pre-auth entries the CONFIGURED allow list holds, as `proto/port` pairs.
+# Entries look like 'allow tcp port 8090' / 'allow udp port 67'; `uci get`
+# renders a list either one entry per line or as a quoted single-line list, so
+# quotes become newlines before matching. BOTH protocols are compared: a stale
+# udp permit is as much a policy divergence as a stale tcp one, and the running
+# ruleset is filtered the same way, so the two sides stay symmetric (comparing
+# raw port numbers would let an `allow udp port 67` entry read as a phantom
+# divergence, because it appears in ndsRTR as a udp rule and never as a tcp one).
+nodogsplash_users_to_router_raw() {
+    uci -q get nodogsplash.@nodogsplash[0].users_to_router 2>/dev/null || echo ""
+}
+
+nodogsplash_configured_accept_entries() {
+    nodogsplash_users_to_router_raw \
+        | tr "'" '\n' \
+        | sed -n 's/^ *allow \([a-z][a-z]*\) port \([0-9][0-9]*\) *$/\1\/\2/p' \
+        | sort -u \
+        | nodogsplash_drop_entry "tcp/$(nodogsplash_gateway_port)"
+}
+
+# Entries the configured list holds that this writer does NOT write and this step
+# cannot turn into a `proto/port` pair — a port range, a multiport entry,
+# anything else an operator may have hand-edited in. Non-empty means the
+# comparison below would cover only PART of the list, which reads as a
+# divergence this step can never repair (it would reload on every run), so it is
+# reported instead of acted on. `uci get` renders a list either one entry per
+# line or as a quoted single-line list, hence the quote splitting and trimming.
+nodogsplash_configured_unparsable_entries() {
+    nodogsplash_users_to_router_raw \
+        | tr "'" '\n' \
+        | sed 's/^ *//;s/ *$//;/^$/d' \
+        | grep -v -E '^allow [a-z]+ port [0-9]+$'
+}
+
+nodogsplash_gateway_port() {
+    uci -q get nodogsplash.@nodogsplash[0].gatewayport 2>/dev/null || echo ""
+}
+
+nodogsplash_drop_entry() { # filter one entry out of a newline separated set
+    if [ -n "$1" ]; then grep -v -x -e "$1"; else cat; fi
+}
+
+# The pre-auth entries the RUNNING ruleset accepts, read from the chain
+# nodogsplash installs for the captive bridge. The gateway port is dropped from
+# both sides of the comparison as `tcp/<gatewayport>`: nodogsplash injects that
+# rule itself, so it is present even when the list does not carry it, and
+# comparing it would reload on every run instead of on a real divergence.
+# Verified on the bench (2026-09-25) that the two sets are EQUAL in steady
+# state, so the step does not fire on an unchanged router.
+nodogsplash_runtime_accept_entries() {
+    iptables -S ndsRTR 2>/dev/null \
+        | grep -- '-j ACCEPT' \
+        | sed -n 's/.*-p \([a-z][a-z]*\) .*--dport \([0-9][0-9]*\).*/\1\/\2/p' \
+        | sort -u \
+        | nodogsplash_drop_entry "tcp/$(nodogsplash_gateway_port)"
+}
+
+# A missing chain makes `iptables -S` fail; that is not the same as an empty
+# one, and the caller must not read "cannot measure" as "converge me".
+nodogsplash_ruleset_present() {
+    iptables -S ndsRTR >/dev/null 2>&1
+}
+
+nodogsplash_accept_rule_count() {
+    iptables -S ndsRTR 2>/dev/null | grep -c -- '-j ACCEPT' || true
+}
+
+nodogsplash_is_running() {
+    if command -v pidof >/dev/null 2>&1; then
+        pidof nodogsplash >/dev/null 2>&1
+    else
+        "$NDS_INIT" status >/dev/null 2>&1
+    fi
+}
+
+nodogsplash_entries_csv() { # [tcp/1,udp/2] — render a newline separated set
+    printf '%s' "$1" | tr '\n' ',' | sed 's/,$//'
+}
+
+converge_nodogsplash_runtime() {
+    local want have before_count after_count rc i unparsable
+
+    if ! nodogsplash_is_running; then
+        log "nodogsplash policy convergence: service not running (first boot) — procd starts it once with the configured allow list, no reload here"
+        return 0
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        log "nodogsplash policy convergence: iptables not available — cannot read the running ruleset, leaving the service alone"
+        return 0
+    fi
+    # Before the comparison, not after: a missing chain means there is nothing to
+    # compare against, and reporting that is more honest than falling through to
+    # "already matches" when both sides happen to be empty.
+    if ! nodogsplash_ruleset_present; then
+        log "nodogsplash policy convergence: no ndsRTR chain to compare against — leaving the service alone"
+        return 0
+    fi
+
+    # Compare only when EVERY configured entry was understood: a list holding an
+    # entry this step cannot turn into a `proto/port` pair would compare only
+    # part of it, read as a divergence it can never repair, and reload the
+    # service on every run. Reported, not assumed-equal — "cannot read the list"
+    # is not "the list is fine".
+    unparsable=$(nodogsplash_configured_unparsable_entries)
+    if [ -n "$unparsable" ]; then
+        log "nodogsplash policy convergence: the configured allow list holds entries this step cannot compare ($(printf '%s' "$unparsable" | tr '\n' ' ')) — leaving the service alone"
+        return 0
+    fi
+
+    want=$(nodogsplash_configured_accept_entries)
+
+    have=$(nodogsplash_runtime_accept_entries)
+    if [ "$have" = "$want" ]; then
+        log "nodogsplash policy convergence: running ruleset already matches the configured allow list ([$(nodogsplash_entries_csv "$want")]) — no reload"
+        return 0
+    fi
+
+    before_count=$(nodogsplash_accept_rule_count)
+    # reload is the intent-revealing verb; for a procd service that defines no
+    # reload of its own (nodogsplash 5.0.2 does not) rc.common's reload calls
+    # restart, so restart is only the fallback for an init script whose reload
+    # fails outright.
+    "$NDS_INIT" reload >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        "$NDS_INIT" restart >/dev/null 2>&1
+        rc=$?
+    fi
+
+    # procd starts the service asynchronously, so wait — bounded — for the
+    # regenerated ruleset to match the configured list before logging the result
+    # rather than guessing with a fixed sleep. Integer seconds only: BusyBox
+    # `sleep 0.5` is rejected on this target (measured 2026-09-25).
+    i=0
+    while [ "$i" -lt 5 ]; do
+        have=$(nodogsplash_runtime_accept_entries)
+        [ "$have" = "$want" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+
+    after_count=$(nodogsplash_accept_rule_count)
+    if [ "$rc" = 0 ]; then
+        log "nodogsplash policy convergence: reloaded after an allow-list change — pre-auth accept rules ${before_count} -> ${after_count}; runtime entries [$(nodogsplash_entries_csv "$have")] (configured [$(nodogsplash_entries_csv "$want")])"
+    else
+        log "nodogsplash policy convergence: reload FAILED (rc=$rc) — the running ruleset may still be stale (pre-auth accept rules ${before_count} -> ${after_count}; runtime entries [$(nodogsplash_entries_csv "$have")], configured [$(nodogsplash_entries_csv "$want")])"
+    fi
+    return 0
 }
 
 setup_tollgate_firewall_rules() {
@@ -237,24 +919,197 @@ enable_modems() {
     done
 }
 
+# -- management (private) subnet selection -----------------------------------
+#
+# The private network's /24 is picked next to the LAN's (x.y.(z+1).0/24): that
+# is what operators expect and what the DNS/DHCP defaults assume. It is only
+# safe while it does not overlap a network the router is already attached to
+# on the upstream side -- the private bridge's default route leaves through
+# the WAN, so a management subnet that contains, or sits inside, the upstream
+# subnet makes traffic for that subnet route back into the router instead of
+# out of the WAN. Seen in the field with a DHCP upstream in the same /24 the
+# deterministic rule had picked.
+#
+# POSIX sh / BusyBox ash only: cut, tr, grep, awk, hexdump.
+
+octet_of() { echo "$1" | cut -d. -f"$2"; }
+prefix24_of() { echo "$1" | cut -d. -f1-3; }
+
+# 255.255.255.0 -> 24. An absent mask is treated as /24, the unit the
+# collision check works in.
+netmask_to_prefixlen() {
+    local bits=0 o
+    for o in $(echo "$1" | tr '.' ' '); do
+        case "$o" in
+            255) bits=$((bits + 8)) ;;
+            254) bits=$((bits + 7)) ;;
+            252) bits=$((bits + 6)) ;;
+            248) bits=$((bits + 5)) ;;
+            240) bits=$((bits + 4)) ;;
+            224) bits=$((bits + 3)) ;;
+            192) bits=$((bits + 2)) ;;
+            128) bits=$((bits + 1)) ;;
+            0) ;;
+        esac
+    done
+    if [ "$bits" -gt 0 ]; then echo "$bits"; else echo 24; fi
+}
+
+# The networks the management /24 must not overlap, as CIDR strings. Two
+# sources, because an upstream address lives in exactly one of them: the
+# configured WAN address (static setups carry it in UCI) and the kernel's view
+# of every address that is not the LAN or the private bridge itself -- a
+# DHCP/STA/FIPS uplink only exists there.
+upstream_networks() {
+    local lan_dev priv_dev wan_ip wan_mask
+    lan_dev=$(uci -q get network.lan.device 2>/dev/null)
+    priv_dev=$(uci -q get network.private.device 2>/dev/null)
+    [ -n "$lan_dev" ] || lan_dev="br-lan"
+    [ -n "$priv_dev" ] || priv_dev="br-private"
+
+    wan_ip=$(uci -q get network.wan.ipaddr 2>/dev/null)
+    if [ -n "$wan_ip" ]; then
+        wan_mask=$(uci -q get network.wan.netmask 2>/dev/null)
+        [ -n "$wan_mask" ] || wan_mask="255.255.255.0"
+        echo "${wan_ip}/$(netmask_to_prefixlen "$wan_mask")"
+    fi
+
+    command -v ip >/dev/null 2>&1 || return 0
+    ip -4 -o addr show 2>/dev/null | awk -v lan="$lan_dev" -v priv="$priv_dev" '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "inet") {
+                    split($(i + 1), a, "/")
+                    if ($2 != "lo" && $2 != lan && $2 != priv) print a[1] "/" a[2]
+                    break
+                }
+            }
+        }'
+}
+
+# Does the /24 prefix $1 ("a.b.c") overlap the network given as CIDR $2?
+subnet_overlaps_cidr() {
+    local cand="$1" cidr="$2" addr len
+    addr="${cidr%%/*}"
+    len="${cidr#*/}"
+    [ "$len" = "$cidr" ] && len=24
+    case "$len" in
+        ''|*[!0-9]*) len=24 ;;
+    esac
+    if [ "$len" -le 8 ]; then
+        [ "$(octet_of "$cand" 1)" = "$(octet_of "$addr" 1)" ]
+    elif [ "$len" -le 16 ]; then
+        [ "$(octet_of "$cand" 1)" = "$(octet_of "$addr" 1)" ] &&
+            [ "$(octet_of "$cand" 2)" = "$(octet_of "$addr" 2)" ]
+    else
+        [ "$(octet_of "$cand" 1)" = "$(octet_of "$addr" 1)" ] &&
+            [ "$(octet_of "$cand" 2)" = "$(octet_of "$addr" 2)" ] &&
+            [ "$(octet_of "$cand" 3)" = "$(octet_of "$addr" 3)" ]
+    fi
+}
+
+# Is the /24 prefix $1 excluded by any of the CIDRs in the remaining args?
+subnet_conflicts() {
+    local cand="$1" cidr
+    shift
+    for cidr in "$@"; do
+        [ -n "$cidr" ] || continue
+        if subnet_overlaps_cidr "$cand" "$cidr"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# One random octet (0-255), using the same BusyBox-safe hexdump idiom as the
+# RSSID suffix above (BusyBox has no `od` guarantee; hexdump it ships).
+random_octet() {
+    local hex
+    hex=$(hexdump -n 1 -e '4/1 "%02X"' /dev/urandom 2>/dev/null | cut -c1-2)
+    case "$hex" in
+        [0-9a-fA-F][0-9a-fA-F]) echo "$(( 0x$hex ))" ;;
+        *) echo 0 ;;
+    esac
+}
+
+# Choose the /24 prefix ("a.b.c") for the management network.
+# $1 is the deterministic, LAN-adjacent candidate, kept whenever it is safe;
+# the remaining arguments are CIDRs it must not overlap.
+choose_private_subnet() {
+    local candidate="$1" tries=0 pick
+    shift
+
+    if ! subnet_conflicts "$candidate" "$@"; then
+        echo "$candidate"
+        return 0
+    fi
+
+    log "Private subnet ${candidate}.0/24 overlaps an upstream-side network; selecting a random non-overlapping /24"
+    while [ "$tries" -lt 32 ]; do
+        pick="10.$(random_octet).$(random_octet)"
+        if ! subnet_conflicts "$pick" "$@"; then
+            echo "$pick"
+            return 0
+        fi
+        tries=$((tries + 1))
+    done
+
+    # Pathological case (an upstream /8, a broken RNG): walk 10/8 for the
+    # first free /24 instead of handing out a subnet we know collides.
+    tries=0
+    while [ "$tries" -lt 4096 ]; do
+        pick="10.$((tries / 256)).$((tries % 256))"
+        if ! subnet_conflicts "$pick" "$@"; then
+            echo "$pick"
+            return 0
+        fi
+        tries=$((tries + 1))
+    done
+
+    log "WARNING: no free management /24 upstream of the collision; keeping ${candidate}.0/24"
+    echo "$candidate"
+}
+
 # Consumes RANDOM_SUFFIX; derives a private /24 adjacent to the LAN subnet.
+# Consumes R2G/R5G (from detect_band_radios) for band-correct radio binding.
 setup_private_network() {
-    local lan_ip octet1 octet2 octet3 private_octet3 private_ip private_ssid private_key
+    local lan_ip lan_mask candidate_prefix candidate_octet3 private_prefix private_ip
+    local private_ssid private_key
+
+    # On routers without a 2.4 GHz radio, private_radio0 rides the 5 GHz
+    # radio so the management network keeps existing at all.
+    PRIV2G="$R2G"
+    [ -n "$PRIV2G" ] || PRIV2G="$R5G"
+    if [ -z "$PRIV2G" ]; then
+        log "ERROR: no usable radio for the private network; skipping"
+        return
+    fi
 
     lan_ip=$(uci -q get network.lan.ipaddr)
     if [ -z "$lan_ip" ]; then
         log "ERROR: no network.lan.ipaddr; skipping private network"
         return
     fi
-    octet1=$(echo "$lan_ip" | cut -d. -f1)
-    octet2=$(echo "$lan_ip" | cut -d. -f2)
-    octet3=$(echo "$lan_ip" | cut -d. -f3)
-    if [ "$octet3" -eq 255 ]; then
-        private_octet3=$((octet3 - 1))
+    # Candidate: the /24 next to the LAN, kept when it is free -- operators
+    # expect it and the DNS/DHCP defaults assume it -- and replaced only when
+    # it would overlap the LAN's own mask or a network on the upstream side
+    # (see choose_private_subnet: a colliding management subnet routes the
+    # upstream's own address range back into the router).
+    lan_mask=$(uci -q get network.lan.netmask)
+    [ -n "$lan_mask" ] || lan_mask="255.255.255.0"
+    candidate_prefix=$(prefix24_of "$lan_ip")
+    candidate_octet3=$(octet_of "$candidate_prefix" 3)
+    if [ "$candidate_octet3" -eq 255 ]; then
+        candidate_octet3=$((candidate_octet3 - 1))
     else
-        private_octet3=$((octet3 + 1))
+        candidate_octet3=$((candidate_octet3 + 1))
     fi
-    private_ip="${octet1}.${octet2}.${private_octet3}.1"
+    candidate_prefix="$(octet_of "$candidate_prefix" 1).$(octet_of "$candidate_prefix" 2).${candidate_octet3}"
+
+    private_prefix=$(choose_private_subnet "$candidate_prefix" \
+        "${lan_ip}/$(netmask_to_prefixlen "$lan_mask")" \
+        $(upstream_networks))
+    private_ip="${private_prefix}.1"
 
     # Preserve credentials across reruns: a SETUP_VERSION bump triggers a
     # full setup on upgraded routers, and regenerating the SSID/PSK there
@@ -300,7 +1155,7 @@ setup_private_network() {
     uci set dhcp.private.leasetime='12h'
 
     uci set wireless.private_radio0='wifi-iface'
-    uci set wireless.private_radio0.device='radio0'
+    uci set wireless.private_radio0.device="$PRIV2G"
     uci set wireless.private_radio0.network='private'
     uci set wireless.private_radio0.mode='ap'
     uci set wireless.private_radio0.ssid="$private_ssid"
@@ -308,14 +1163,21 @@ setup_private_network() {
     uci set wireless.private_radio0.key="$private_key"
     uci set wireless.private_radio0.disabled='0'
 
-    uci set wireless.private_radio1='wifi-iface'
-    uci set wireless.private_radio1.device='radio1'
-    uci set wireless.private_radio1.network='private'
-    uci set wireless.private_radio1.mode='ap'
-    uci set wireless.private_radio1.ssid="$private_ssid"
-    uci set wireless.private_radio1.encryption='psk2+ccmp'
-    uci set wireless.private_radio1.key="$private_key"
-    uci set wireless.private_radio1.disabled='0'
+    # Second private AP only when a distinct 5 GHz radio exists; on
+    # single-band routers the stale section would bind to a phantom radio.
+    if [ -n "$R5G" ] && [ "$R5G" != "$PRIV2G" ]; then
+        uci set wireless.private_radio1='wifi-iface'
+        uci set wireless.private_radio1.device="$R5G"
+        uci set wireless.private_radio1.network='private'
+        uci set wireless.private_radio1.mode='ap'
+        uci set wireless.private_radio1.ssid="$private_ssid"
+        uci set wireless.private_radio1.encryption='psk2+ccmp'
+        uci set wireless.private_radio1.key="$private_key"
+        uci set wireless.private_radio1.disabled='0'
+    elif uci -q get wireless.private_radio1 >/dev/null 2>&1; then
+        log "No distinct 5 GHz radio; removing stale private_radio1"
+        uci delete wireless.private_radio1
+    fi
 
     uci set firewall.private_zone='zone'
     uci set firewall.private_zone.name='private'
@@ -341,6 +1203,13 @@ commit_all() {
 
 # -- driver -----------------------------------------------------------------
 
+# Offline-test hook: sourcing with TOLLGATE_SETUP_LIB_ONLY=1 defines every
+# function above without running the setup — tests/uci-defaults-band_test.sh
+# exercises the band logic against a fake uci. Never set on a router.
+if [ "${TOLLGATE_SETUP_LIB_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # Check if full setup is needed (version mismatch or first boot)
 EXISTING_VERSION=""
 if [ -f "$SETUP_FLAG" ]; then
@@ -348,23 +1217,92 @@ if [ -f "$SETUP_FLAG" ]; then
 fi
 
 if [ "$EXISTING_VERSION" = "$SETUP_VERSION" ]; then
-    # Same version — verify wireless APs only (fixes #103/#173: APs missing
-    # after reinstall when setup-done flag persisted from a prior install).
+    # Same version — verify wireless APs, re-assert the uhttpd contract
+    # (fixes #103/#173: APs missing after reinstall when setup-done flag
+    # persisted from a prior install).
     : > "$LOGFILE"
     chmod 600 "$LOGFILE"
-    log "Flag matches $SETUP_VERSION — verifying wireless APs only"
+    log "Flag matches $SETUP_VERSION — verifying wireless APs, the uhttpd contract and the portal allow list"
+
+    load_brand
 
     # Recover gateway name from existing config for AP SSID consistency
     GATEWAY_NAME=$(uci -q get wireless.tollgate_2g_open.ssid 2>/dev/null) || \
     GATEWAY_NAME=$(uci -q get wireless.default_radio0.ssid 2>/dev/null) || \
-    GATEWAY_NAME="TollGate-$(hexdump -n 3 -e '4/1 "%02X"' /dev/urandom | cut -c1-4)"
-    RANDOM_SUFFIX="${GATEWAY_NAME#TollGate-}"
+    GATEWAY_NAME="${BRAND_HOSTNAME}-$(hexdump -n 3 -e '4/1 "%02X"' /dev/urandom | cut -c1-4)"
+    RANDOM_SUFFIX="${GATEWAY_NAME#*-}"
 
-    configure_radio_ap 'default_radio0' 'tollgate_2g_open'
-    configure_radio_ap 'default_radio1' 'tollgate_5g_open'
-    uci -q get wireless.radio0 >/dev/null && uci set wireless.radio0.disabled='0'
-    uci -q get wireless.radio1 >/dev/null && uci set wireless.radio1.disabled='0'
+    detect_band_radios
+    setup_band_ap "$R2G" 'tollgate_2g_open'
+    setup_band_ap "$R5G" 'tollgate_5g_open'
+    enable_all_radios
     uci commit wireless
+
+    # A reinstall/upgrade re-asserts the whole uhttpd contract — not just the
+    # wireless APs. uhttpd.main and uhttpd.portal are written by this script
+    # AND by the feed's 92-tollgate-admin-setup, and install order decides
+    # which write lands last; skipping setup_uhttpd here left the loser of
+    # that race in charge of the config. A stale uhttpd.main.redirect_https
+    # pointing :8080 at a dead :443 is what locked the operator out of LuCI
+    # on the 2026-09-21 pre13 build. Every function below is idempotent, so
+    # the export diff decides whether a commit is needed at all — an
+    # unreadable export commits unconditionally rather than drop a delta.
+    uhttpd_before=$(uci export uhttpd)
+    setup_uhttpd
+    setup_uhttpd_portal
+    # Reinstall must also repair the :8090 layout — a repair that added
+    # 8090 to uhttpd.main (LuCI docroot) survives same-version reinstalls
+    # otherwise, and the configUI section is never re-ensured.
+    sanitize_uhttpd_main_configui_port
+    setup_uhttpd_configui
+    # The board's credential is re-asserted with the rest of the uhttpd
+    # contract: this path runs on every reinstall whose version string is
+    # unchanged, and a credential-less router must not keep serving an admin
+    # board that rpcd opens to ANY password.
+    enforce_admin_credential
+    uhttpd_after=$(uci export uhttpd)
+    if [ -z "$uhttpd_before" ] || [ "$uhttpd_before" != "$uhttpd_after" ]; then
+        uci commit uhttpd
+        log "uhttpd config re-asserted (drift repaired)"
+    else
+        log "uhttpd config already matches the contract — nothing to commit"
+    fi
+
+    # The captive-portal allow list is re-asserted here for the same reason
+    # the uhttpd contract is: this path runs on every reinstall whose version
+    # string is unchanged, and the list decides what the pre-auth client can
+    # reach at all. A list written by an older install (or by an install
+    # predating a new rule) survived the reinstall untouched, so the pre-auth
+    # :443 allow entry was missing on a router that had just been "upgraded" —
+    # nodogsplash REJECTed the redirect_https hop and LuCI stayed unreachable.
+    # Idempotent: nothing is added when the list is already complete, and the
+    # export diff decides whether a commit is needed at all.
+    nds_before=$(uci export nodogsplash)
+    assert_nodogsplash_allow_entries
+    nds_after=$(uci export nodogsplash)
+    if [ -z "$nds_before" ] || [ "$nds_before" != "$nds_after" ]; then
+        uci commit nodogsplash
+        log "nodogsplash allow list re-asserted (missing pre-auth entries repaired)"
+    else
+        log "nodogsplash allow list already complete — nothing to commit"
+    fi
+
+    # The #428 loop guard must also fire here: a device upgrading from a
+    # pre-#432 install can carry a stale gatewaydomainname while its
+    # SETUP_VERSION already matches (postinst and the boot hook re-run
+    # this script, but only version-changing upgrades reached the full
+    # setup where the delete used to live).
+    if uci -q get nodogsplash.@nodogsplash[0].gatewaydomainname >/dev/null 2>&1; then
+        uci delete nodogsplash.@nodogsplash[0].gatewaydomainname
+        uci commit nodogsplash
+        log "Deleted stale nodogsplash gatewaydomainname (same-version path)"
+    fi
+    # A repaired allow list is not a delivered policy: the running nodogsplash
+    # holds the ruleset it generated from the list it saw at start-up. Converge
+    # it here, after the commit above, so an upgrade or a repair on a RUNNING
+    # router takes effect without an operator restart (and so a fresh boot,
+    # where procd has not started the service yet, is left untouched).
+    converge_nodogsplash_runtime
     log "Wireless AP verification completed"
     exit 0
 fi
@@ -374,18 +1312,31 @@ fi
 chmod 600 "$LOGFILE"  # contains the WiFi password — keep it root-only
 log "Running full setup (version $SETUP_VERSION, previous: ${EXISTING_VERSION:-none})"
 
+load_brand
+
 setup_uhttpd
 setup_uhttpd_portal
+sanitize_uhttpd_main_configui_port
+setup_uhttpd_configui
+enforce_admin_credential
 setup_dns_dnsmasq
 setup_hostname
+detect_band_radios
 setup_public_wifi            # exports RANDOM_SUFFIX, GATEWAY_NAME
 setup_nodogsplash
 setup_tollgate_firewall_rules
 setup_profile_hook
 setup_disable_ipv6_lan
 enable_modems
-setup_private_network        # consumes RANDOM_SUFFIX
+setup_private_network        # consumes RANDOM_SUFFIX, R2G/R5G
 commit_all
+
+# After the commit: on a version-changing upgrade of an ALREADY-RUNNING router
+# the nodogsplash that is serving right now holds the ruleset generated from the
+# previous allow list, and nothing in the packaging path reloads it. On a fresh
+# boot this is a no-op (the service is not up yet; procd starts it once, with
+# the config committed above).
+converge_nodogsplash_runtime
 
 log "TollGate setup completed (version $SETUP_VERSION)"
 echo "$SETUP_VERSION" > "$SETUP_FLAG"
