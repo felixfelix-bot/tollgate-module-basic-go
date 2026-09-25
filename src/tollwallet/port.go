@@ -191,6 +191,13 @@ type WalletPort interface {
 	// received in the token's unit (typically satoshis).
 	Receive(token Token) (uint64, error)
 
+	// SwapFeeSats returns the fee (in sats) the mint charges to swap the
+	// token's proofs — the sum of each proof's keyset InputFeePpk, then
+	// ceil/1000, matching gonuts' feesForProofs. Returns an error when the
+	// fee cannot be determined (mint unreachable, or the cdk wallet which
+	// does not implement it); callers must fall back to classifying Receive.
+	SwapFeeSats(token Token) (uint64, error)
+
 	// GetBalance returns the total wallet balance across all mints.
 	GetBalance() uint64
 
@@ -232,6 +239,12 @@ type WalletPort interface {
 	// Melt executes a melt quote, paying the invoice and consuming
 	// wallet proofs.
 	Melt(quoteID string) (*MeltResult, error)
+
+	// AcceptMint admits a configured mint into the accepted set at
+	// runtime (idempotent). Mints unreachable at wallet construction are
+	// otherwise rejected forever, even after they recover — the health
+	// tracker calls this when a configured mint becomes reachable.
+	AcceptMint(mintURL string) error
 
 	// Shutdown releases wallet resources (database handles, CGO
 	// objects). Must be idempotent.
