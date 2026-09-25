@@ -153,7 +153,7 @@ and [Semantic Versioning](https://semver.org/).
   machine-readable). `/session-state` keeps answering `none` — with an empty
   `mac` instead of the sentinel — and `/whoami` answers an empty `mac=` instead
   of echoing it
-  ([#PRNUM](https://github.com/felixfelix-bot/tollgate-module-basic-go/pull/PRNUM)).
+  ([#548](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/548)).
 - **Identity is resolved from the socket, never from a client-asserted `mac`.**
   `/whoami`, `GET /session-state`, `POST /`, `POST /ln-invoice` and
   `GET /ln-invoice` took the caller's own claim — a `mac` query parameter, or the
@@ -169,7 +169,7 @@ and [Semantic Versioning](https://semver.org/).
   one input the client cannot choose — and canonicalise it before use. A
   client-supplied `mac` is still accepted on the wire (the pinned portal sends
   it) and has no effect on the outcome
-  ([#PRNUM](https://github.com/felixfelix-bot/tollgate-module-basic-go/pull/PRNUM)).
+  ([#548](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/548)).
 - **The spendable Cashu token is no longer written to the log.** `POST /` logged
   its whole request body at debug — and on that route the body *is* the bearer
   instrument, so whoever read the line could spend it, with debug being the level
@@ -184,7 +184,7 @@ and [Semantic Versioning](https://semver.org/).
   reports, and it is useless to anyone reading the log — unlike the bare SHA-256
   a log-reader could check a guess against. A source-level test fails if a logging
   call is ever handed a token-carrying value again
-  ([#PRNUM](https://github.com/felixfelix-bot/tollgate-module-basic-go/pull/PRNUM)).
+  ([#548](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/548)).
 - **The late-`Receive` notice no longer tells the customer to spend the same
   note twice.** When `Receive` outlived its deadline the notice said *"Payment
   processing timed out after 30 seconds. Please try again."* — and acting on that
@@ -198,7 +198,7 @@ and [Semantic Versioning](https://semver.org/).
   changes from `payment-processing-timeout` to `payment-outcome-unknown`; the
   journal/janitor that would collect the late result and grant it is a separate
   follow-up, and this change does not claim access arrives on its own
-  ([#PRNUM](https://github.com/felixfelix-bot/tollgate-module-basic-go/pull/PRNUM)).
+  ([#548](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/548)).
 
 - **A mint answering 429 no longer stops sales, and a flood can no longer drive
   it there.** `POST /ln-invoice` is unauthenticated and, before this change,
