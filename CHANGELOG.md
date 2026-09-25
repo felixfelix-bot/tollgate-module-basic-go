@@ -64,6 +64,28 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The API no longer waits for every mint before it binds, so a cold boot is no
+  longer a blind money path.** `merchant.New()` ran the startup probe to
+  completion before `main()` ever reached `http.ListenAndServe` — one probe per
+  accepted mint, each with the 30 s `probeTimeout` — so on a boot where the
+  uplink is not up yet every probe burns its full timeout and `:2121` and
+  `/var/run/tollgate.sock` do not exist for up to `7 mints x 30 s = 210 s`,
+  while procd's `status` reports `running` the whole time because it reports the
+  *process*, not the API. Measured on the bench MT3000 (fresh install + reboot,
+  pre17): `status` running, `:2121` absent from `netstat -tln`, no
+  `/var/run/tollgate.sock`, `tollgate wallet balance` failing with ENOENT, and
+  the acceptance run refusing at stage 0 with `TCP 2121 not answering` — then
+  `PASS TCP 2121` minutes later with nothing changed. The probe is now bounded
+  by `defaultStartupProbeBudget` (30 s: the one full chance a mint already had)
+  and mints the budget never reaches are left **unlearned** rather than marked
+  failed — the convention `runProactiveCheck` already uses for a mint it skipped
+  inside its `Retry-After` window — so the aggressive 15 s loop, the proactive
+  loop and the degraded-to-full upgrade path are unchanged. Overridable per
+  router with `TOLLGATE_STARTUP_PROBE_BUDGET_SECONDS`. Regression tests:
+  `src/merchant/startup_probe_budget_test.go` (RED at 14.01 s with 7
+  non-answering mints and a 2 s client timeout; GREEN at 1.00 s; the fast path
+  and the knob arithmetic covered in the same file).
+
 - **A policy change now reaches the running nodogsplash: the setup script
   reloads the service when its `ndsRTR` ruleset no longer matches the configured
   `users_to_router` list.** The allow list is nodogsplash's *pre-authentication*
