@@ -1,6 +1,6 @@
 # uhttpd.main.redirect_https Ownership — One Derived Value, One Rule, Two Writers
 
-## Status: Decided (2026-09-21). Rule hardened 2026-09-26 — see below.
+## Status: Decided (2026-09-21). Rule hardened 2026-09-26; captive-side product decision recorded 2026-09-26 — see below.
 
 `uhttpd.main.redirect_https` is a **derived value**, not a configured one: one
 rule, evaluated by two writers. LuCI's `:8080` may only be redirected to the
@@ -99,11 +99,20 @@ login itself was never broken: `POST /ubus session.login` over `:8443` and
 ## Consequences
 
 - Neither script may hardcode this option again: both evaluate the rule above.
-  **The feed's `92-tollgate-admin-setup` still carries the superseded
-  existence-only guard and must be updated to the same rule** — this repository
-  cannot change it. Until it is, correctness depends on install order: `99` runs
+  **Superseded (2026-09-26): the earlier reading of this bullet — that the feed's
+  `92-tollgate-admin-setup` "still carries the superseded existence-only guard",
+  and that correctness therefore depends on install order because "`99` runs
   after `92` and lands the coverage-checked value last, so the shipped
-  combination is safe, but the two writers do not yet evaluate the same premise.
+  combination is safe" — is retracted.** The second writer's *source* was
+  aligned to this rule by
+  [`tollgate-captive-portal-site#64`](https://github.com/OpenTollGate/tollgate-captive-portal-site/pull/64)
+  (merged, `0e311e93`). What is still stale is the **pin**, not the rule: this
+  repository stages and ships a *pinned* pre-#64 copy of that script, and the
+  feed vendors its own pinned copy, so the script that actually reaches a router
+  still carries the existence-only premise — and on the module's install pass
+  it is `92` that runs **last**, putting back the `1` that `99` derived away.
+  Numeric order is not the safety argument here; see "Install order is NOT a
+  safety net" below and caveat (a) in the product-decision section.
 - `99-tollgate-setup` **provisions** the router's TLS identity instead of
   inheriting the image's placeholder: on both the full-setup and the
   verify/repair path it drives the module's own generator
@@ -153,8 +162,8 @@ login itself was never broken: `POST /ubus session.login` over `:8443` and
 ## Product decision: what answers the captive side (2026-09-26)
 
 The operator-facing question behind this document — "https problems logging into
-the admin portal" — is really two decisions, and only the second one is recorded
-here:
+the admin portal" — is really two decisions, and only the second is decided here;
+the first is recorded in the reachability document and the drop rules:
 
 1. **What is the captive side answered by?** Not the router's administration UI.
    A client that is not on the owner's private network is answered by the captive
@@ -191,8 +200,14 @@ kept the superseded existence-only premise until portal PR
 [#64](https://github.com/OpenTollGate/tollgate-captive-portal-site/pull/64),
 which evaluates the same coverage rule through the same CLI predicate and adds a
 cross-repo guard
-(`packaging/tests/test-redirect-https-single-rule.sh`) that fails if **either**
-writer carries a premise of its own. Two caveats, deliberately recorded instead
+(`OpenTollGate/tollgate-captive-portal-site:packaging/tests/test-redirect-https-single-rule.sh`)
+that fails if **either** writer carries a premise of its own. It reads both
+writers: the portal's own `92-tollgate-admin-setup`, and this repository's
+`99-tollgate-setup` via `MODULE_SCRIPT=<file>` / `MODULE_DIR=<dir>`, or a shallow
+fetch of this repository when neither is set (strict in CI, skipped locally
+without network). No such file exists in this repository: `packaging/tests/` is
+absent here, and this module keeps its packaging tests under `tests/packaging/*.sh`.
+Two caveats, deliberately recorded instead
 of implied: (a) the source moving is not the router receiving it — the module's
 `packaging/build-inputs.json .portal.commit` and the feed's `vendor.lock.json`
 must be advanced for the aligned script to ship, and until then the install-order

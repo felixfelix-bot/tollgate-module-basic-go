@@ -168,11 +168,12 @@ and [Semantic Versioning](https://semver.org/).
   last — which is why "the other script also writes it" is a live hazard rather
   than a style note: a writer with the superseded existence-only premise derives
   `1` for an identity no browser can validate, after the coverage rule derived
-  `0`. The portal repo's copy of `92` is being aligned to the same rule and now
-  carries a cross-repo guard over the pair; the pins (this module's
-  `packaging/build-inputs.json .portal.commit`, the feed's `vendor.lock.json`)
-  still have to advance for that to reach a router, which the document states
-  explicitly.
+  `0`. The portal repo's copy of `92` was aligned to the same rule by
+  `tollgate-captive-portal-site#64` (merged), which adds a cross-repo guard over
+  the pair; the pins (this module's `packaging/build-inputs.json .portal.commit`,
+  still `e6fe0e0e70f38ee5d9675fd1908efd261945e040` dated 2026-09-23 — pre-#64 —
+  and the feed's `vendor.lock.json`) still have to advance for that to reach a
+  router, which the document states explicitly.
   ([#594](https://github.com/OpenTollGate/tollgate-module-basic-go/pull/594))
 
 - **The valve's timeout test asserts the timeout contract, not the host's
