@@ -291,6 +291,39 @@ else
   bad "refuses an empty expectation set (exit 2)" "rc=$rc out=$out"
 fi
 
+# 15b. the GitHub lane's `matrix` output is {architecture, format} rows — the
+#      .ipk/.apk flags are stripped there (define-package-matrix). A gate wired
+#      to the flags-only shape reads zero expectations from it and exits 2 on
+#      every non-tag run (measured: fork runs 35947890140 / 35946323449).
+MATRIX_FORMAT_ROWS='{"include":[{"architecture":"aarch64_cortex-a53","format":"ipk"},{"architecture":"x86_64","format":"ipk"}]}'
+out=$(VERIFY_MIRRORS=1 bash "$VERIFY" "$V" dev "$MATRIX_FORMAT_ROWS" 2>&1); rc=$?
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q "ok: aarch64_cortex-a53/ipk" \
+   && printf '%s' "$out" | grep -q "ok: x86_64/ipk"; then
+  ok "reads expectations from the {architecture, format} matrix the workflow emits"
+else
+  bad "reads expectations from the {architecture, format} matrix the workflow emits" "rc=$rc out=$out"
+fi
+
+# 15c. a matrix-JSON carrying .ipk/.apk flags AND .format must not double-count:
+#      the two sources are unioned into the same (arch, format) pairs.
+MATRIX_BOTH='{"include":[{"architecture":"aarch64_cortex-a53","ipk":true,"apk":true,"format":"ipk"}]}'
+out=$(VERIFY_MIRRORS=1 bash "$VERIFY" "$V" dev "$MATRIX_BOTH" 2>&1); rc=$?
+if [ $rc -eq 0 ] && [ "$(printf '%s\n' "$out" | grep -c 'ok: aarch64_cortex-a53/')" = "2" ]; then
+  ok "unions .format and .ipk/.apk flags into the same pair set (no duplicate)"
+else
+  bad "unions .format and .ipk/.apk flags into the same pair set (no duplicate)" "rc=$rc out=$out"
+fi
+
+# 15d. a matrix-JSON whose rows carry neither a known .format nor .ipk/.apk is
+#      still a loud exit 2, never a silent pass.
+MATRIX_OPAQUE='{"include":[{"architecture":"aarch64_cortex-a53"}]}'
+out=$(VERIFY_MIRRORS=1 bash "$VERIFY" "$V" dev "$MATRIX_OPAQUE" 2>&1); rc=$?
+if [ $rc -eq 2 ] && printf '%s' "$out" | grep -q "expectation set is empty"; then
+  ok "refuses a matrix with no usable expectation (exit 2, never a pass)"
+else
+  bad "refuses a matrix with no usable expectation (exit 2, never a pass)" "rc=$rc out=$out"
+fi
+
 # --- ngit-matrix-expectations.sh --------------------------------------------
 # The release matrix is sharded across one workflow file per group of legs, so
 # the gate reads the union of them; a single shard would verify a subset.
