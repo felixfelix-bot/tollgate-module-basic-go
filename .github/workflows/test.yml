@@ -106,6 +106,20 @@ jobs:
           # was never wired into CI, so nothing ran it automatically.
           bash tests/packaging/package-nodogsplash-dependency_test.sh
 
+      - name: Publication-verification gate contract (both matrix shapes)
+        run: |
+          # Offline (nak/curl are shimmed, no relay, no key, nothing published):
+          # the gate must derive its expectations from the SAME matrix JSON the
+          # release workflow hands it. define-package-matrix's `matrix` output
+          # emits rows of {architecture, format} - the .ipk/.apk flags are
+          # deleted there - while the parser read only the flags, so it derived
+          # zero expectations and exited 2 on every non-tag run (fork run
+          # 35947890140 job 107473812016: "ERROR: the expectation set is empty").
+          # This pins both shapes and the empty/malformed exits, so the drift
+          # cannot come back silently. The suite has existed since the gate
+          # landed but was never wired into CI, so nothing ran it automatically.
+          bash tests/verify_publication_test.sh
+
       - name: Setup-marker ordering (roll-back safety)
         run: |
           # Offline (no router, no SDK, no network): the setup script's version
