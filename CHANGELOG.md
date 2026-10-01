@@ -12,6 +12,29 @@ and [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A stale captive-portal bundle in a built package is now caught without a
+  browser, on every packaging row.** `tests/packaging/assert-artifact-contents.sh`
+  already read a built `.ipk`/`.apk`; it now also asserts the #60 renewal
+  markers on the guest bundle *inside that artifact* — at least one
+  `session_expired_buy_more` (the in-page renewal CTA the fix introduced) and
+  zero `session_expired_reconnect` (the "reconnect to the Wi-Fi" dead end it
+  removed). Both are i18n key literals, so they survive minification and are
+  discriminating: the pinned revision counts 1/0, the pre-#60 revision 0/1. The
+  assertion reads the package bytes and never the portal pin, because the
+  regression that reached a router had an honest pin and a correct committed
+  tree — `build-inputs.json .portal.commit` was cosmetic and the shipped bundle
+  was older, so every source-level guard was green and only the browser check
+  `portal:expired-renewal-cta` saw it. The guard is wired where the rows already
+  run package-content assertions, so it fires in the PR gate's happy-path job
+  (x86_64 `.ipk`), in the release lane's `.ipk` rows and in its x86_64 `.apk`
+  row. The happy-path suite remains the behavioural authority; this fails the
+  same class earlier, without a browser. A packaging path that ships no guest
+  bundle is reported, not failed — such a row cannot ship a stale bundle.
+  Guarded by `tests/packaging/stale-portal-bundle_test.sh`, which proves the
+  sensitivity with hermetic fixtures (a package carrying the dead end is
+  rejected; one carrying the CTA is accepted) and pins that the checker never
+  consults the pin.
+
 - **`generate_admin_password()` no longer depends on `od`, which is absent from
   the stripped busybox shipped on OpenWrt 25.12.5 base images.** On those
   images the old `od -An -N 20 -tu1 /dev/urandom` pipeline produced no output,

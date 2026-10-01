@@ -106,6 +106,18 @@ jobs:
           # was never wired into CI, so nothing ran it automatically.
           bash tests/packaging/package-nodogsplash-dependency_test.sh
 
+      - name: Stale guest portal bundle is caught without a browser
+        run: |
+          # assert-artifact-contents.sh asserts the #60 renewal markers on the
+          # bytes INSIDE a built package, so every packaging row fails on a stale
+          # guest bundle without booting anything. This proves the checker is
+          # actually sensitive to it (hermetic fixtures, no node, no portal
+          # clone) and that it decides from the artifact rather than from the
+          # portal pin - the shape of the regression that reached a router with
+          # every source-level guard green (fork PR
+          # felixfelix-bot/tollgate-module-basic-go#10).
+          bash tests/packaging/stale-portal-bundle_test.sh
+
       - name: Setup-marker ordering (roll-back safety)
         run: |
           # Offline (no router, no SDK, no network): the setup script's version
