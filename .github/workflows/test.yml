@@ -66,13 +66,33 @@ jobs:
       - name: Schema lint
         run: node tests/contract/js-schema-lint.mjs
 
-      - name: Portal pin decode contract
+      - name: Portal bundle contract (pin decode + admin-redirect coverage)
         run: |
-          # The shipped captive portal is built from .portal.commit; a pinned
-          # revision that validates tokens with a keyset-requiring decode
-          # (getDecodedToken without a MintKeyset list) rejects every v4
-          # cashuB token carrying a short keyset id - i.e. coinos/minibits -
-          # which the portal reports as #CU102.
+          # The shipped captive portal is built from .portal.commit, so this
+          # step gates the PIN, not the tree:
+          #
+          #   check A  a pinned revision that validates tokens with a
+          #            keyset-requiring decode (getDecodedToken without a
+          #            MintKeyset list) rejects every v4 cashuB token carrying a
+          #            short keyset id - i.e. coinos/minibits - which the portal
+          #            reports as #CU102.
+          #   checks C/D/E  the MAC on the Lightning calls, the LN003/LN004
+          #            strings, the swap-fee gate's keyset objects, the in-page
+          #            renewal and the note's mint.
+          #   check F  packaging/files/etc/uci-defaults/92-tollgate-admin-setup
+          #            is NOT in this repository (the module ships 90 and 99; 92
+          #            is staged from the pin into the package), so it is resolved
+          #            FROM THE PIN and must derive uhttpd.admin.redirect_https
+          #            from the module CLI's own coverage predicate
+          #            (`tollgate ssl covers`), write an explicit value in BOTH
+          #            directions, and not decide the hop from a fixed-path test
+          #            on the image's placeholder pair (/etc/uhttpd.crt,
+          #            CN=OpenWrt) - which satisfies every existence check while
+          #            covering neither the router's hostname nor its LAN IP, and
+          #            redirected :8090 into a hard certificate error.
+          #
+          # Check F fails rather than skips when the pin is unreadable, in every
+          # environment; checks A-E are strict in CI and skip offline.
           bash tests/packaging/assert-portal-bundle-contract.sh
 
       - name: Packaging recipe dependency contract
@@ -86,6 +106,20 @@ jobs:
           # was never wired into CI, so nothing ran it automatically.
           bash tests/packaging/package-nodogsplash-dependency_test.sh
 
+      - name: Publication-verification gate contract (both matrix shapes)
+        run: |
+          # Offline (nak/curl are shimmed, no relay, no key, nothing published):
+          # the gate must derive its expectations from the SAME matrix JSON the
+          # release workflow hands it. define-package-matrix's `matrix` output
+          # emits rows of {architecture, format} - the .ipk/.apk flags are
+          # deleted there - while the parser read only the flags, so it derived
+          # zero expectations and exited 2 on every non-tag run (fork run
+          # 35947890140 job 107473812016: "ERROR: the expectation set is empty").
+          # This pins both shapes and the empty/malformed exits, so the drift
+          # cannot come back silently. The suite has existed since the gate
+          # landed but was never wired into CI, so nothing ran it automatically.
+          bash tests/verify_publication_test.sh
+
       - name: Setup-marker ordering (roll-back safety)
         run: |
           # Offline (no router, no SDK, no network): the setup script's version
@@ -96,6 +130,100 @@ jobs:
           # suffixed markers and the alpha4->alpha5->alpha4 round trip, and its
           # negative control fails if the comparison ever goes back to equality.
           bash tests/uci-defaults-setup-marker-order_test.sh
+
+      - name: Admin TLS identity (HTTPS is not inherited from the image)
+        run: |
+          # Offline (no router, no SDK, no network): the install path must
+          # PROVISION a TLS identity that covers this router and must derive
+          # uhttpd.main.redirect_https from a COVERAGE check, not from a
+          # readable-and-non-empty certificate file. The OpenWrt image ships a
+          # placeholder (CN=OpenWrt, SAN DNS:OpenWrt) that satisfies the old
+          # guard while covering neither the hostname nor the LAN IP, so :8080
+          # redirected a browser into a hard certificate error (bench MT3000,
+          # 2026-09-26). The suite drives the shipped uci-defaults script end to
+          # end against a fixture, pins the operator opt-out that `tollgate ssl
+          # remove` records, and carries a negative control that runs the
+          # pre-change rule over the same fixture and must derive
+          # redirect_https=1 from the placeholder.
+          bash tests/uci-defaults-admin-tls-identity_test.sh
+      - name: LuCI is not reachable pre-auth (guest path is the portal)
+        run: |
+          # Offline (no router, no daemon, no network): LuCI's :8080/:443 must
+          # not be in nodogsplash's pre-auth allow list, and a list that carries
+          # them must be repaired on every setup path. Measured on the bench
+          # MT3000 (2026-09-25, pre17): a paying guest who typed
+          # `http://<router>/` fell through to `https://<router>/` and got the
+          # router's administration login, which the operator read as
+          # "the install is broken".
+          bash tests/uci-defaults-luci-ports-not-pre-auth_test.sh
+
+      - name: A trusted client gets a plain-HTTP entry point on :80
+        run: |
+          # Offline (no router, no daemon, no network): nodogsplash DNATs :80 to
+          # its splash port only for a PRE-AUTH client, so for a trusted or
+          # authenticated one `http://<router>/` was dead (nothing listened) and
+          # the client fell through to LuCI. The suite pins the uhttpd.trusted
+          # :80 listener, its redirect stub to the portal SPA on :2051, and that
+          # both setup paths re-assert it.
+          bash tests/uci-defaults-trusted-entry-80_test.sh
+
+      - name: The wired LAN ports move onto the operator's private bridge
+        run: |
+          # Offline (no router, no daemon, no network): the wired LAN ports
+          # must be MOVED off the captive bridge onto br-private - the
+          # operator's trusted network with internet, the admin board and
+          # LuCI, no payment step - discovered from the bridge's device
+          # section (never named per board), idempotently, with the captive
+          # bridge's port list cleared so a port is never on two layer-2
+          # domains. The same-version verify/repair path re-asserts the
+          # placement (a factory reset is repaired), the module keep-list
+          # still carries /etc/config/network, and all four guard fragments
+          # are pinned byte-identical to main and still br-lan-scoped - that
+          # literal is what keeps a guest off :8090/:8443 and LuCI while a
+          # br-private client gets in. A neutralised-writer negative control
+          # must go red.
+          bash tests/uci-defaults-lan-private-wired_test.sh
+
+      - name: One device code (hostname, captive SSID and private SSID agree)
+        run: |
+          # Offline (no router, no SDK, no network): the router's identity is
+          # ONE code, minted once, stored in /etc/config/tollgate and reused —
+          # never re-minted. Measured on the bench MT3000 (2026-09-26):
+          # hostname=tollgate-OQ3Q while the captive SSID had been re-minted to
+          # tollgate-0GLK by a later deploy and the private SSID carried a
+          # suffix from a third mint path, because nothing was ever stored. The
+          # suite pins the adoption order (store, machine-shaped hostname,
+          # machine-shaped SSID, mint), the store's authority over every other
+          # source, that an already-deployed router adopts the code it is
+          # already known by instead of minting a third one, the <nym>-<code>
+          # private SSID with `tollgate network private rename` as the honoured
+          # escape hatch, and that the shipped script has exactly ONE mint site.
+          # The same case table is pinned on the installer side
+          # (OpenTollGate/tollgate-installer, branding_test.go), with two
+          # documented exceptions in docs/architecture/one-device-code.md: the
+          # nym charset and the installer's suffix-less nodogsplash banner.
+          bash tests/uci-defaults-device-code_test.sh
+
+      - name: The portal banner is one value on both paths, and committed
+        run: |
+          # Offline (no router, no daemon, no network): nodogsplash's
+          # `gatewayname` is the string a captive client reads on the splash
+          # page, and TWO writers in the shipped driver produce it — the full
+          # setup and the verify/repair convergence a same-version reinstall
+          # takes. The repair path used to converge on a second spelling (no
+          # " Portal" suffix) and never committed it on a settled router: its
+          # block runs BEFORE the nodogsplash export-diff snapshot the
+          # conditional commit is taken against, so the write stayed a
+          # /tmp/.uci session delta, the config file kept the old banner, and
+          # any later `uci commit nodogsplash` re-applied the stale delta on top
+          # of the file (PR #605 cold review, findings F1/F2). This suite drives
+          # BOTH paths end to end against a DELTA-AWARE uci (a committed state
+          # file plus a pending-delta file, as real uci has under /tmp/.uci) and
+          # pins one committed banner value from each path with no gatewayname
+          # op left pending. The other suites cannot see it: their flat-file uci
+          # returns empty for `export`, so their harness commits unconditionally.
+          bash tests/uci-defaults-gatewayname-banner_test.sh
+
 
       - name: Spec-quote drift check
         run: |

@@ -10,11 +10,16 @@
 #
 # Usage: scripts/verify_publication.sh <version> <channel> [<expectation-source>]
 #   expectation-source:
-#     <matrix-json>  the build matrix (`include[]` with .architecture and
-#                    .ipk/.apk flags) — the GitHub lane passes the output of
-#                    define-package-matrix, so expectations come from what the
-#                    build matrix declared, never from whatever happened to get
-#                    published.
+#     <matrix-json>  the build matrix (`include[]` with .architecture; a row's
+#                    format comes from a `.format` field and/or the `.ipk`/
+#                    `.apk` booleans). The GitHub lane passes the `matrix`
+#                    output of define-package-matrix — whose rows are
+#                    `{architecture, format}` (the .ipk/.apk flags are stripped
+#                    there) — so expectations come from what the build matrix
+#                    declared, never from whatever happened to get published.
+#                    Both shapes are accepted; the flags form is kept because
+#                    tests/verify_publication_test.sh and the documented
+#                    pre-#406 wire shape use it.
 #     -              expectations come from $VERIFY_EXPECT instead: one
 #                    `arch/format` pair per line. The ngit lane uses this,
 #                    because ngit-ci does not support a dynamic matrix; its
@@ -88,10 +93,20 @@ if [ "$MATRIX" = "-" ]; then
   }
   expected=$(printf '%s\n' "$VERIFY_EXPECT" | tr ' ' '\n' | grep -v '^$' | sort -u)
 else
+  # Accept both matrix shapes: rows carrying a `.format` field (what
+  # define-package-matrix's `matrix` output emits: {architecture, format}, the
+  # .ipk/.apk flags deleted) and rows carrying the `.ipk`/`.apk` booleans (the
+  # original wire shape). Only rows with a usable architecture+format yield a
+  # pair; anything else is dropped here and is caught by the explicit
+  # empty/malformed checks below, so a shape the parser cannot read is still a
+  # loud exit 2, never a silent pass.
   expected=$(printf '%s' "$MATRIX" | jq -r '
-    [.include[] | .architecture as $a |
-       (if .ipk then "\($a)/ipk" else empty end),
-       (if .apk then "\($a)/apk" else empty end)] | unique[]' 2>/dev/null) || {
+    [ .include[] as $r
+      | ([ (if ($r.format == "ipk" or $r.format == "apk") then $r.format else empty end),
+           (if $r.ipk then "ipk" else empty end),
+           (if $r.apk then "apk" else empty end) ]
+         | unique | .[] as $f | "\($r.architecture)/\($f)") ]
+    | unique[]' 2>/dev/null) || {
     echo "ERROR: expectation source is neither '-' nor a build matrix JSON" >&2
     exit 2
   }
