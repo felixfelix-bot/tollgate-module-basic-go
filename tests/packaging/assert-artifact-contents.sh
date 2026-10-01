@@ -12,6 +12,27 @@
 # source byte-for-byte in size (an empty or truncated file is a failure, not
 # a pass).
 #
+# A second invariant rides along on the same packaged artifact: the guest
+# portal bundle the package ships must be the revision the #60 fix produced (an
+# expired session renews IN PAGE instead of the "reconnect to the Wi-Fi" dead
+# end). It is asserted on the PACKAGED BYTES — every
+# etc/tollgate/tollgate-captive-portal-site/assets/*.js read out of the built
+# .ipk/.apk — and never by re-deriving the bundle from
+# packaging/build-inputs.json .portal.commit. A guard that reads the pin cannot
+# see stale bytes, which is exactly how the dead end reached a router with every
+# source-level guard green (PR felixfelix-bot/tollgate-module-basic-go#10: the
+# pin was honest, the shipped tree was older, and only a browser caught it).
+# The two i18n key literals survive minification and discriminate:
+#
+#   staged bundle              session_expired_buy_more   session_expired_reconnect
+#   pinned (fixed) portal       1                          0
+#   pre-#60 portal              0                          1
+#
+# so the invariant is: buy_more >= 1 AND reconnect == 0. A packaging row that
+# ships no guest portal at all is reported and not evaluated — such a row cannot
+# ship a stale bundle, and the runtime-set report below already names that
+# divergence as its own defect.
+#
 # Usage: tests/packaging/assert-artifact-contents.sh <package-file>
 #
 #   .ipk  -> read the data tarball with tar
@@ -172,5 +193,65 @@ if [ -s "$MISSING" ]; then
     echo "   ruleset invariant checked above)"
 fi
 
+# ------------------------------------------- the guest portal's #60 markers
+# See the header: the packaged guest bundle must carry the #60 fix, asserted on
+# the bytes inside THIS artifact. Nothing here reads the portal pin.
+echo
+echo "--- packaged guest portal: #60 renewal markers ---"
+GUEST_REL="etc/tollgate/tollgate-captive-portal-site"
+GUEST_ASSETS="$ARTIFACT_ROOT/$GUEST_REL/assets"
+PORTAL_FAIL=0
+buy_more=0
+reconnect=0
+guest_js_count=0
+
+if [ ! -d "$GUEST_ASSETS" ]; then
+    echo "  not evaluated: this packaging path ships no $GUEST_REL/assets/"
+    echo "  (a row that ships no guest bundle cannot ship a stale one; see the"
+    echo "   packaging-path divergence report above)"
+else
+    # Only the guest SPA's own assets. The admin board is NOT read here: it is a
+    # separate webroot the apk row installs under /www/<brand>, so it would make
+    # the marker counts row-dependent for no gain.
+    for js in "$GUEST_ASSETS"/*.js; do
+        [ -f "$js" ] || continue
+        guest_js_count=$((guest_js_count + 1))
+        # `|| true` inside the substitution: grep exits 1 on a marker that is
+        # absent (the interesting case for session_expired_reconnect), and
+        # `set -e` + pipefail would otherwise abort the guard on it.
+        n=$({ grep -o -F -- 'session_expired_buy_more' "$js" || true; } | wc -l | tr -d ' ')
+        buy_more=$((buy_more + n))
+        n=$({ grep -o -F -- 'session_expired_reconnect' "$js" || true; } | wc -l | tr -d ' ')
+        reconnect=$((reconnect + n))
+    done
+
+    if [ "$guest_js_count" -eq 0 ]; then
+        echo "  not evaluated: $GUEST_REL/assets/ carries no *.js"
+    else
+        echo "  guest JS assets scanned: $guest_js_count"
+        echo "  session_expired_buy_more  (want >= 1) : $buy_more"
+        echo "  session_expired_reconnect (want == 0) : $reconnect"
+        [ "$buy_more" -ge 1 ] || PORTAL_FAIL=1
+        [ "$reconnect" -eq 0 ] || PORTAL_FAIL=1
+    fi
+fi
+
+if [ "$PORTAL_FAIL" -ne 0 ]; then
+    echo
+    echo "FAIL: the packaged guest portal is not the #60 revision."
+    echo "      An expired session's only action in the shipped bundle is the"
+    echo "      'reconnect to the Wi-Fi' dead end (#60), or the renewal CTA the fix"
+    echo "      introduced is absent, so a customer whose session expired cannot buy"
+    echo "      more time without dropping the association."
+    echo "      The package must carry the guest bundle built from the pinned portal"
+    echo "      revision; rebuild it with 'bash packaging/portal-build.sh' and"
+    echo "      repackage. The pin alone is not evidence: this assertion reads the"
+    echo "      bytes inside the artifact."
+    exit 1
+fi
+
 echo
 echo "PASS: all $nft_expected etc/nftables.d/*.nft ruleset file(s) are packaged intact (and nothing else is)."
+if [ "$guest_js_count" -gt 0 ]; then
+    echo "PASS: the packaged guest portal carries the #60 renewal CTA and not the dead end."
+fi
