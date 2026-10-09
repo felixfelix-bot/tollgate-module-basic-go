@@ -11,6 +11,24 @@ and [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 ### Changed / Internal
 
+- **The ngit release shard plan is now documented against its measurements,
+  with the rows that do not exist yet named as outstanding.** `.ngit/README.md`
+  gains a shard-level measurement ledger — the `upx --ultra-brute` 515 s cost
+  that sets the grain, the 706.7 s stage-1 wall clock, the 13.6 s relay round
+  trip, the 600–1500 s per-shard budgets against the 1800 s ceiling — and
+  separates what is *proven* from what is *pending*. Proven: the `.apk` leg
+  end to end at the SDK level (a real 7.7 MiB
+  `tollgate-wrt_v0.6.0-alpha2_x86_64.apk` fetched back from three Blossom
+  mirrors, leg + shard-completion records published), and the announce gate
+  refusing a partial release (`tests/ngit-release-pipeline_test.sh`, 48/0,
+  including the failed-shard, shorter-than-plan and stale-release-run
+  refusals). Pending, and stated as such: the per-shard kind-9842 run ids and
+  the whole-matrix wall clock, because no shard invocation has run on the
+  coordinator (`NGIT_CI_MAX_CONCURRENT_JOBS=1` serialises the matrix) — a
+  `nak req -k 9842` shows stage-1/test lanes only. The stale "two files, two
+  budgets" description of the deleted single-file `build-package.yml` is
+  removed in favour of the eleven-shard plan actually shipped.
+
 - **The bcm2709 artifact rows build again.** `build-sdk-package.sh`
   defaulted bcm2709 to `EXPECTED_ARCH=arm_cortex-a7`, but the SDK stages
   its packages under `arm_cortex-a7_neon-vfpv4` — the staged-packages

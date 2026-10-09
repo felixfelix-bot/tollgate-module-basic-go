@@ -210,8 +210,9 @@ aarch64 pair on a 2-CPU cap (pinned upx 5.2.1; `--fast` 1.5 s, `--best` 67 s,
 `--brute` 401 s; mipsel ultra-brute 418 s), so one ultra-brute leg per shard
 fits a budget with room and five do not. The `.apk`/SDK legs get a whole
 invocation each because on the unsharded run their containers were created and
-then never got a slot — that is the difference between "the .apk path is
-unproven" and "the .apk path cannot run".
+then never got a slot — that is the difference between "the .apk path was
+unproven" and "the .apk path cannot run" (it has since been exercised at the
+SDK level; see "Measurements" below).
 
 Why shard instead of raising the ceiling (`NGIT_CI_JOB_TIMEOUT_SECS` is an
 operator-side setting and could be raised): the same leg cost ~29 minutes
@@ -290,7 +291,7 @@ dependencies. That is very unlikely to finish inside 30 minutes from a cold SDK
 image, and there is no way to raise the ceiling from inside the workflow — the
 timeout belongs to the coordinator operator.
 
-**The split is implemented — two files, two budgets.** The first manual
+**The split is by stage, and stage 2 is further sharded.** The first manual
 replay of the single-file pipeline (commit `1312f03`) was rejected by act's
 schema validator in 675 ms; after that was fixed, the replay at `63eb38f` was
 still inside `compile-binaries` eleven minutes in, with the Go module cache at
@@ -300,8 +301,14 @@ pipeline is split by stage:
 
 1. `build-package-binaries.yml` — `determine-versioning`, `compile-binaries`,
    `build-portal`. Its own 30 minutes.
-2. `build-package.yml` — `resolve-inputs`, `package-ipk` (14), `package-apk`
-   (3), `publish-metadata`, `os-handoff`. Its own 30 minutes.
+2. **stage 2 — eleven shards.** The single-file `build-package.yml` described
+   here historically (`resolve-inputs`, `package-ipk` ×14, `package-apk` ×3,
+   `publish-metadata`, `os-handoff`) **did not fit and has been deleted**. It
+   is replaced by `build-package-<shard>.yml` ×11 plus
+   `build-package-announce.yml`, each with its own 30-minute invocation. The
+   shard plan, the grain and the announce gate are in "Sharded stage 2" above;
+   the plan is generated from `packaging/ngit-release-matrix.json` by
+   `scripts/ngit-gen-shards.py`, so the shard files are never hand-edited.
 
 They are tied together by the build id (the commit's short SHA) and by two
 addressable kind-30078 records that stage 1 publishes:
@@ -312,24 +319,24 @@ d=tollgate-build/<build_id>/portal     {"sha256":"…","filename":"portal-assets
 ```
 
 `resolve-inputs` polls the coordination relays for those records for up to 10
-minutes, so the two stages can be started back to back at the **same commit**
-— and on a push to `main` both files are triggered by the same push anyway.
-This is the ngit-native replacement for the twin's `needs.<job>.outputs`
+minutes, so the stages can be started back to back at the **same commit**.
+Only stage 1 is push-triggered; the shards are manual-replay only (see
+"Triggers"), which is deliberate — a push to `main` must not start thirteen
+serial 30-minute invocations on a host that runs them one at a time. This is
+the ngit-native replacement for the twin's `needs.<job>.outputs`
 (ngit-ci has no cross-file `needs`) and for `actions/upload-artifact` (broken
-here). A stage 2 run against a commit whose stage 1 never ran fails loudly in
+here). A shard run against a commit whose stage 1 never ran fails loudly in
 `resolve-inputs` with that explanation.
 
-Each package job also publishes its **own** kind-1063 announcement, immediately
-after its Blossom upload, instead of one `publish-metadata` job announcing
-everything at the end. `publish-metadata` now verifies the announcements
-against the build records, republishes any that are missing, and prints the
-summary. The reason is the 30-minute ceiling: a run that is cut off mid-matrix
-must still have announced everything it did build.
-
-If three SDK architectures still do not fit one budget once their wall time is
-measured, the same file is copied once per architecture
-(`build-package-apk-mediatek-filogic.yml`, `build-package-apk-x86-64.yml`) —
-they are independent runs that share the build id.
+**No shard publishes a kind-1063.** The old single-file stage 2 had every
+package job announce as soon as its own artifact uploaded, so a run cut off at
+the ceiling left the world with a *partial* release that looked finished: the
+`b25d8a28` run announced 5 of 17 legs and looked like a release. That is the
+bug the sharding change removes. Announcements are published only by
+`build-package-announce.yml`, one per leg, and only after
+`scripts/ngit-release-announce.sh` has confirmed that every shard and every leg
+of the same (version, channel, release run) is present and `success` — see
+"Nothing is announced until the whole release exists".
 
 ### What the first full stage-2 run actually measured
 
@@ -347,31 +354,97 @@ result `b555a2057913fdb934af2b1facb3fc0000c2b58ac4248273d83ca596cfb6772c`,
   job at 2 CPUs.
 * The other 8 UPX legs did not finish, and the 3 `.apk` legs never executed a
   single step: their containers were created, but a 4-vCPU host saturating at
-  ~2–4 concurrent jobs never freed a slot from the 14 `.ipk` legs. **The
-  `.apk`/SDK path is still unproven on ngit** — say so plainly rather than
-  implying it works.
+  ~2–4 concurrent jobs never freed a slot from the 14 `.ipk` legs. **At the
+  time, the `.apk`/SDK path was unproven on ngit.** It is no longer unproven —
+  the SDK packaging itself has since been exercised end to end, and the announce
+  gate that this run's partial success exposed has been built and tested — see
+  "Measurements" below. No `.apk` *shard invocation* has run on the coordinator
+  yet, so the shard-level `.apk` evidence is still outstanding.
 
 So the full 14 + 3 matrix does **not** fit one 30-minute `act` invocation as
 written. The ceiling is the coordinator operator's (`--job-timeout-secs`), so no
-change inside the workflow can raise it. Options, in order of preference:
+change inside the workflow can raise it. Three options were on the table:
 
 1. **Raise the coordinator's `--job-timeout-secs`** (one operator-side setting).
    Cheapest and needs no workflow change, but the measured stage-1 wall time is
    11.8 min warm / 20.8 min cold, so the compile stage is already close to the
    ceiling and a package stage wants 45–60 min for the whole matrix.
-2. **Split by compression family**, one budget per known cost:
-   `build-package.yml` keeps `resolve-inputs` + the 5 `compression: none` legs +
-   `publish-metadata` + `os-handoff` (measured: 4 announced inside ~7 min), and
-   a new file carries the 9 UPX legs, at most one arch family per file.
+2. **Split by compression family**, one budget per known cost —
+   `comparison: none` legs cheap, `upx --ultra-brute` legs expensive.
 3. **Give the SDK legs their own files**
    (`build-package-apk-mediatek-filogic.yml`, `build-package-apk-x86-64.yml`)
-   with the SDK image from a cache rather than cold: pulling
-   `openwrt/sdk:<target>-25.12.0` and compiling `nodogsplash` + `luci` + `jq`
-   will not fit 30 minutes even with the whole box.
+   with the SDK image from a cache rather than cold.
 
-Coverage is not reduced by any of these: the 14 + 3 matrix stays exactly as it
-is. The follow-up is *coordination* — more, smaller files — not fewer
-architectures.
+**What was actually taken is 2 and 3 at a per-leg grain.** Stage 2 is sharded
+by each leg's *measured* cost, not by compression family alone — every
+`upx --ultra-brute` leg gets its own file (a family split still stacks several
+of them into one invocation and reproduces the `b25d8a28` starvation), the
+cheap `none`/`fast`/`best` legs are grouped, and each `.apk`/SDK leg is its own
+file. The plan, the per-shard budgets and the announce gate are in "Sharded
+stage 2" above.
+
+Coverage is not reduced by any of them: the 14 + 3 matrix stays exactly as it
+is. The fix is *coordination* — more, smaller files — not fewer architectures.
+
+### Measurements: what is recorded, and what is still outstanding
+
+This is the shard-level ledger the plan is sized from. A row appears only with
+its source; anything not yet measured is named as outstanding rather than
+estimated into a table.
+
+| quantity | value | source |
+| --- | --- | --- |
+| `upx --ultra-brute`, aarch64 pair, 2 CPUs | **515 s** | `packaging/ngit-release-matrix.json`, pinned upx 5.2.1, measured 2026-09-20 |
+| same leg inside the *unsharded* run | ~29 min | commit `b25d8a28` — starvation (14 containers on a 4-vCPU host, 2-CPU-per-job cap), not cost |
+| `upx --fast` / `--best` / `--brute`, same binary | 1.5 s / 67 s / 401 s | same measurement |
+| `upx --ultra-brute`, mipsel_24kc | 418 s | `packaging/ngit-release-matrix.json` |
+| stage 1 (`build-package-binaries.yml`), wall clock | 706.7 s (11.8 min) | live kind-9842 result for `b25d8a28` |
+| one job's nak publish + Blossom fetch-back + kind-30078 round trip | 13.6 s | `ci-probe.yml`, commit `8e79b43` |
+| `.apk`/SDK packaging (`make package/tollgate-wrt/compile` in the SDK image) | **181 s** | 2026-09-21, `openwrt/sdk:x86-64-25.12.0@sha256:0061d8c6…`, output `tollgate-wrt_v0.6.0-alpha2_x86_64.apk` |
+| shard budgets / ceiling / plan total | 600–1500 s each; ceiling 1800 s; total 14220 s | `scripts/ngit-shards.sh budget <id>` / `ceiling` / `total-budget` |
+
+**The `.apk` leg is proven end to end at the SDK level.** Built for real: the
+7.7 MiB `tollgate-wrt_v0.6.0-alpha2_x86_64.apk` above was uploaded to Blossom
+mirrors and fetched back with a matching sha256 from three of them
+(`blossom2.orangesync.tech`, `files.sovbit.host`, `nostr.download`), and both
+its leg record and its shard-completion record (kind 30078, keyed
+`d=tollgate-build/<release_run>/shard/<shard_id>`) were published. The mirror
+finding that came out of it — the GitHub-twin mirrors hold the same 7.7 MiB
+`.apk` on only one host, so the "≥2 mirrors" check could not pass there — is
+why `scripts/ngit-gen-shards.py` lists `files.sovbit.host` and
+`nostr.download` ahead of the defaults.
+
+**The announce gate is proven to refuse a partial release.** This is tested,
+not asserted: `tests/ngit-release-pipeline_test.sh` runs the gate offline and
+passes 48/0, including
+
+```
+ok   a release with one failed shard is REFUSED
+ok   --publish cannot publish a release with a failed shard
+ok   --publish published NOTHING for the failed-shard release
+ok   a shard that reported fewer legs than the plan is REFUSED
+ok   a leg record from another release run is REFUSED (staleness)
+ok   release_run == build_id is refused (exit 2)
+```
+
+That is the "a failed or timed-out shard leaves the release unannounced"
+property, exercised rather than claimed. A full-matrix run that died at the
+ceiling would therefore publish zero kind-1063 events.
+
+**Still outstanding, and how that is known.** Two rows cannot be filled yet:
+the per-shard live **kind-9842 ids with durations**, and the **total wall clock
+for the full matrix**. No shard workflow has ever run on this coordinator, so
+there is nothing to report. That is not an assumption — `nak req -k 9842 -l
+1000 wss://relay.ngit.dev` returns results for
+`.ngit/act/workflows/build-package-binaries.yml` (stage 1), `test.yml`,
+`go-test.yml`, `repro-check.yml` and `router-test.yml`, and **none** for any
+`build-package-<shard>.yml` or `build-package-announce.yml`. The blocker is
+capacity, not code: the coordinator here (DQ05) runs
+`NGIT_CI_MAX_CONCURRENT_JOBS=1`, so a full matrix is thirteen serial
+invocations (stage 1, eleven shards, announce), and the per-invocation queue
+wait has been observed at up to ~4.6 h on a loaded host — hours, not minutes.
+These rows go in the table the first time `scripts/ngit-ci-release.sh` completes
+a matrix; until then the absence is stated, not papered over.
 
 ## Verified end to end on ngit (2026-09-12)
 
@@ -383,7 +456,7 @@ for this repository.
 | stage | workflow | how it started | workflow result (kind 9842) | conclusion | wall |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `build-package-binaries.yml` | push to this ref | `460e9dc6d4ea12759e96889e776dfda6cf5e397560468f973351ba7f910b3a7c` | `success` | 706.7 s |
-| 2 | `build-package.yml` | manual `9840 342cb7de9d0969d70480b3846f95c42d9aff9ebd353d09f1ef72598572017e8e` | `b555a2057913fdb934af2b1facb3fc0000c2b58ac4248273d83ca596cfb6772c` | `timed_out` (ceiling) | 1800 s |
+| 2 | `build-package.yml` (pre-shard stage 2 — since deleted, see "Sharded stage 2") | manual `9840 342cb7de9d0969d70480b3846f95c42d9aff9ebd353d09f1ef72598572017e8e` | `b555a2057913fdb934af2b1facb3fc0000c2b58ac4248273d83ca596cfb6772c` | `timed_out` (ceiling) | 1800 s |
 
 Stage 1's hand-over records (kind 30078, signed by the CI release key):
 
