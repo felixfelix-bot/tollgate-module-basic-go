@@ -12,10 +12,11 @@
 #
 # Overrides:
 #   ORG=OpenTollGate
-#   RUNNER_HOST=debian@<vps-ip-or-ula>
-#   RUNNER_NAME=openTollGate-vps2-01
+#   RUNNER_HOST=debian@<vps-ip-or-ula>      (default: vps3 hermes-nvme)
+#   RUNNER_NAME=openTollGate-vps3-01
 #   RUNNER_LABELS=self-hosted,linux,x64,openwrt-builder
 #   SSH_KEY=~/.ssh/id_hermes_vps
+#   SSH_JUMP=user@<mesh-jump-host>          (required if you have no NetBird route)
 #   GH_TOKEN=<org-owner-pat>   (otherwise uses the active `gh` account)
 #
 # Self-gating: dies on the first red, never half-registers.
@@ -23,13 +24,14 @@
 set -euo pipefail
 
 ORG="${ORG:-OpenTollGate}"
-RUNNER_HOST="${RUNNER_HOST:-debian@fdfd:c0e5:3717:6cb1:bb60:de97:987e:7149}"
-RUNNER_NAME="${RUNNER_NAME:-openTollGate-vps2-01}"
+RUNNER_HOST="${RUNNER_HOST:-debian@fdb8:d8ff:833c:6814:5865:55ac:3c98:afd9}"  # vps3 hermes-nvme (allows :22 on the mesh iface)
+RUNNER_NAME="${RUNNER_NAME:-openTollGate-vps3-01}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,x64,openwrt-builder}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_hermes_vps}"
 SVC="actions.runner.${ORG}.${RUNNER_NAME}.service"
 
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12)
+[[ -n "${SSH_JUMP:-}" ]] && SSH_OPTS+=(-J "$SSH_JUMP")
 [[ -r "$SSH_KEY" ]] && SSH_OPTS+=(-i "$SSH_KEY")
 
 bold() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -68,6 +70,8 @@ bold "reaching runner host: $RUNNER_HOST"
 HOSTINFO="$(ssh "${SSH_OPTS[@]}" "$RUNNER_HOST" \
   'uname -m; nproc; df -Pk / | tail -1 | awk "{print \$4}"' 2>&1)" || {
   bad "cannot SSH to $RUNNER_HOST"; sed 's/^/       /' <<<"$HOSTINFO"
+  warn "the runner host is on the NetBird mesh (ULA fdb8:…/fdfd:…) — you need a mesh route."
+  warn "from a machine WITHOUT the mesh, hop through one that has it:  SSH_JUMP=user@<mesh-jump-host>"
   die "fix access to the host (check the mesh/VPN is up) and re-run."; }
 ARCH_RAW="$(sed -n 1p <<<"$HOSTINFO")"
 NPROC="$(sed -n 2p <<<"$HOSTINFO")"
