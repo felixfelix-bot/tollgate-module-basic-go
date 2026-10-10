@@ -6,7 +6,8 @@
 # connection.
 #
 # Run from a machine that can (a) authenticate to GitHub as an ORG OWNER and
-# (b) SSH to the runner host.
+# (b) SSH to the runner host. The host (vps3) sits on the FIPS IPv6 mesh, so
+# (b) means "be a FIPS peer, or hop through one" — see SSH_JUMP below.
 #
 #   curl -fsSL <url> | bash
 #
@@ -16,15 +17,19 @@
 #   RUNNER_NAME=openTollGate-vps3-01
 #   RUNNER_LABELS=self-hosted,linux,x64,openwrt-builder
 #   SSH_KEY=~/.ssh/id_hermes_vps
-#   SSH_JUMP=user@<mesh-jump-host>          (required if you have no NetBird route)
+#   SSH_JUMP=user@<fips-jump-host>          (required if this machine is not a FIPS peer)
 #   GH_TOKEN=<org-owner-pat>   (otherwise uses the active `gh` account)
+#   RUNNER_TOKEN=<org registration token>   (skips gh + org-owner auth entirely:
+#     mint it on any org-owner machine with
+#       gh api -X POST /orgs/<ORG>/actions/runners/registration-token -q .token
+#     and run this script on any host that can reach the runner host)
 #
 # Self-gating: dies on the first red, never half-registers.
 
 set -euo pipefail
 
 ORG="${ORG:-OpenTollGate}"
-RUNNER_HOST="${RUNNER_HOST:-debian@fdb8:d8ff:833c:6814:5865:55ac:3c98:afd9}"  # vps3 hermes-nvme (allows :22 on the mesh iface)
+RUNNER_HOST="${RUNNER_HOST:-debian@fdb8:d8ff:833c:6814:5865:55ac:3c98:afd9}"  # vps3 hermes-nvme (FIPS ULA; :22 allowed on the FIPS iface)
 RUNNER_NAME="${RUNNER_NAME:-openTollGate-vps3-01}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,x64,openwrt-builder}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_hermes_vps}"
@@ -42,14 +47,22 @@ die()  { bad "$*"; exit 1; }
 
 # --------------------------------------------------------------- 0. preflight
 bold "preflight"
-command -v gh  >/dev/null || die "gh CLI not found. Install it and re-run."
 command -v ssh >/dev/null || die "ssh not found."
-ACTIVE_USER="$(gh api user --jq .login 2>/dev/null || true)"
-[[ -n "$ACTIVE_USER" ]] || die "no GitHub auth. Run 'gh auth login', or re-run as:
+if [[ -n "${RUNNER_TOKEN:-}" ]]; then
+  ok "using the supplied registration token (no gh / org-owner auth needed)"
+else
+  command -v gh  >/dev/null || die "gh CLI not found. Install it and re-run, or supply RUNNER_TOKEN=..."
+  ACTIVE_USER="$(gh api user --jq .login 2>/dev/null || true)"
+  [[ -n "$ACTIVE_USER" ]] || die "no GitHub auth. Run 'gh auth login', or re-run as:
          GH_TOKEN=<org-owner-pat> bash -c \"\$(curl -fsSL <url>)\""
-ok "authenticated as: $ACTIVE_USER"
+  ok "authenticated as: $ACTIVE_USER"
+fi
 
 # ------------------------------------------- 1. DIAGNOSE the org Actions policy
+if [[ -n "${RUNNER_TOKEN:-}" ]]; then
+  bold "org Actions policy"
+  warn "skipped: needs an org-owner credential; RUNNER_TOKEN was supplied instead."
+else
 bold "diagnosing org Actions policy (usually the real reason runs never start)"
 PERMS="$(gh api "/orgs/$ORG/actions/permissions" 2>&1 || true)"
 if [[ "$PERMS" == *'"message"'* ]]; then
@@ -64,15 +77,24 @@ if [[ "$(jq -r '.enabled // empty' <<<"$PERMS" 2>/dev/null)" == "false" ]]; then
          gh api -X PUT /orgs/$ORG/actions/permissions -f enabled=true -f allowed_actions=all"
 fi
 ok "Actions enabled for $ORG"
+fi
 
 # ------------------------------------------------------- 2. reach the host
 bold "reaching runner host: $RUNNER_HOST"
 HOSTINFO="$(ssh "${SSH_OPTS[@]}" "$RUNNER_HOST" \
   'uname -m; nproc; df -Pk / | tail -1 | awk "{print \$4}"' 2>&1)" || {
   bad "cannot SSH to $RUNNER_HOST"; sed 's/^/       /' <<<"$HOSTINFO"
-  warn "the runner host is on the NetBird mesh (ULA fdb8:…/fdfd:…) — you need a mesh route."
-  warn "from a machine WITHOUT the mesh, hop through one that has it:  SSH_JUMP=user@<mesh-jump-host>"
-  die "fix access to the host (check the mesh/VPN is up) and re-run."; }
+  warn "the runner host is on the FIPS IPv6 mesh (ULA fd…), reachable ONLY from a FIPS peer — NetBird is a different overlay and will not help."
+  if command -v fips >/dev/null 2>&1 && fipsctl show status >/dev/null 2>&1; then
+    warn "FIPS is installed here but the host still doesn't answer — check 'fipsctl show status' and that this node is enrolled in the host's network."
+  else
+    warn "this machine is not a FIPS peer. Join the FIPS mesh, or hop through a host that is:"
+  fi
+  warn "  curl -fsSL <this-url> | SSH_JUMP=<user>@<fips-jump-host> bash     e.g. SSH_JUMP=c03rad0r@192.168.2.43"
+  warn "  (a hop still needs THIS machine to hold a key the runner host accepts, e.g. ~/.ssh/id_hermes_vps)"
+  warn "  no FIPS and no key? mint a token on an org-owner box, then run this on a FIPS peer:"
+  warn "    RUNNER_TOKEN=<token> bash -c \"\$(curl -fsSL <this-url>)\""
+  die "fix access to the host (bring FIPS up, or pass SSH_JUMP/RUNNER_TOKEN) and re-run."; }
 ARCH_RAW="$(sed -n 1p <<<"$HOSTINFO")"
 NPROC="$(sed -n 2p <<<"$HOSTINFO")"
 FREE_GB=$(( $(sed -n 3p <<<"$HOSTINFO") / 1024 / 1024 ))
@@ -85,10 +107,18 @@ ok "host: $ARCH_RAW, ${NPROC} cores, ${FREE_GB} GB free"
 (( FREE_GB >= 6 )) || die "only ${FREE_GB} GB free on the runner host; need >= 6 GB."
 
 # ------------------------------------------------------- 3. registration token
-bold "requesting an org registration token"
-TOKEN="$(gh api -X POST "/orgs/$ORG/actions/runners/registration-token" --jq .token 2>/dev/null || true)"
-[[ -n "$TOKEN" ]] || die "could not mint a registration token — not an org owner/admin of $ORG."
-ok "token minted (ephemeral, ~1 h)"
+bold "registration token"
+if [[ -n "${RUNNER_TOKEN:-}" ]]; then
+  TOKEN="$RUNNER_TOKEN"
+  ok "using the supplied token (skipped minting)"
+else
+  TOKEN="$(gh api -X POST "/orgs/$ORG/actions/runners/registration-token" --jq .token 2>/dev/null || true)"
+  [[ -n "$TOKEN" ]] || die "could not mint a registration token — not an org owner/admin of $ORG.
+         Mint one on an org-owner machine and pass it in:
+           gh api -X POST /orgs/$ORG/actions/runners/registration-token -q .token
+           RUNNER_TOKEN=<token> bash -c \"\$(curl -fsSL <url>)\""
+  ok "token minted (ephemeral, ~1 h)"
+fi
 
 # ------------------------------------------------------- 4. install + configure
 bold "installing the runner on the host"
