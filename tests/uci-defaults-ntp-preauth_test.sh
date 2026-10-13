@@ -40,6 +40,40 @@ grep -q 'enable_server' "$TMP/ntp_fragment.sh" \
 
 mkdir -p "$TMP/bin" "$TMP/init.d"
 
+# ---- the name the guard must probe: derived, never hardcoded
+#
+# `pidof` dereferences /proc/<pid>/exe and returns the basename of the
+# PROCESS — the `PROG=` value at the top of the live init script — or
+# nothing. So the seam this guard sits on is "the setup script's pidof
+# argument == basename of the image's PROG=/usr/sbin/ntpd" == `ntpd`.
+#
+# The baseline is read from the live init script when this host has one
+# (every OpenWrt target, and any host with a rootfs checkout); otherwise it
+# falls back to the documented constant, PROG=/usr/sbin/ntpd for the busybox
+# sysntpd shipped in OpenWrt 25.12 (verified in
+# openwrt/rootfs:x86_64-openwrt-25.12). The repo does not vendor
+# /etc/init.d/sysntpd — it is image-owned — so the constant is the baseline
+# and NTP_PROG names the file a checkout may override it with.
+NTP_INIT_SCRIPT="${NTP_INIT_SCRIPT:-/etc/init.d/sysntpd}"
+PROG_FROM_INIT=""
+if [ -r "$NTP_INIT_SCRIPT" ]; then
+    PROG_FROM_INIT=$(sed -n 's|^PROG=\(.*\)$|\1|p' "$NTP_INIT_SCRIPT" | head -n1)
+fi
+NTP_PROG="${PROG_FROM_INIT:-/usr/sbin/ntpd}"
+NTP_PROG_COMM="${NTP_PROG##*/}"
+
+# The setup script's own pidof argument, read out of the live source (not
+# echoed from the constant above, or the cross-check would only be asserting
+# itself). Scoped to setup_ntp_server: the file probes other services too
+# (nodogsplash, uhttpd) and those are not this guard. Comments are stripped
+# first — the function's own prose explains the regression and a bare `grep
+# pidof` would scan those words as if they were a probe. Both spellings the
+# call may use are accepted: the bare applet name and an absolute path.
+PROBED_COMMS=$(awk '/^setup_ntp_server\(\) \{/,/^\}/' "$SCRIPT" \
+    | sed 's/[[:space:]]*#.*$//' \
+    | grep -oE 'pidof[[:space:]]+[A-Za-z0-9_./-]+' \
+    | awk '{print $2}' | sed 's|.*/||' | sort -u)
+
 # ---- fake uci: flat-file state, the subset the function uses
 cat > "$TMP/bin/uci" <<'SHIM'
 #!/usr/bin/env bash
@@ -66,12 +100,21 @@ esac
 SHIM
 chmod +x "$TMP/bin/uci"
 
-# ---- fake pidof: controlled by PIDOF_SYSNTPD (empty = not running)
-cat > "$TMP/bin/pidof" <<'SHIM'
+# ---- fake pidof: answers to the REAL process comm (see PROG below)
+#
+# The service process is busybox `ntpd` — `/etc/init.d/sysntpd` sets
+# PROG=/usr/sbin/ntpd and busybox `pidof` matches the process comm, NOT the
+# init-script name. Case 4 used to accept the literal string `sysntpd`, which
+# is why it stayed green while the production guard (`pidof sysntpd`) was
+# dead on hardware: it proved the shim, not the seam. The name answered here
+# is derived from the live init script by the cross-check below and must be
+# the same name the setup script probes; a shim that accepts only `sysntpd`
+# reproduces the dead guard instead of masking it.
+cat > "$TMP/bin/pidof" <<SHIM
 #!/usr/bin/env bash
-[ "$1" = "sysntpd" ] || exit 1
-[ -n "${PIDOF_SYSNTPD:-}" ] || exit 1
-printf '%s\n' "$PIDOF_SYSNTPD"
+[ "\$1" = "$NTP_PROG_COMM" ] || exit 1
+[ -n "\${PIDOF_NTPD:-}" ] || exit 1
+printf '%s\n' "\$PIDOF_NTPD"
 SHIM
 chmod +x "$TMP/bin/pidof"
 
@@ -123,13 +166,32 @@ else
     bad "enable_server=0 survived: $(cat "$S3")"
 fi
 
-# ---- case 4: a RUNNING sysntpd is restarted exactly once
+# ---- case 4: a RUNNING ntpd is restarted exactly once
+#
+# The probe must be the real process name. `pidof sysntpd` returns nothing on
+# hardware (the comm is `ntpd`), so this case fails against the shipped guard
+# — which is the point: it now measures the production seam.
 S4="$TMP/state4"; : > "$S4"
-RESTART_LOG="$TMP/restarts" PIDOF_SYSNTPD=1234 run_ntp_setup "$S4"
+RESTART_LOG="$TMP/restarts" PIDOF_NTPD=1234 run_ntp_setup "$S4"
 if [ "$(wc -l < "$TMP/restarts" 2>/dev/null || echo 0)" = "1" ]; then
-    ok "a running sysntpd is restarted exactly once"
+    ok "a running $NTP_PROG_COMM is restarted exactly once"
 else
-    bad "restart count = $(wc -l < "$TMP/restarts" 2>/dev/null || echo 0), want 1"
+    bad "restart count = $(wc -l < "$TMP/restarts" 2>/dev/null || echo 0), want 1 — the guard probed a process name that is not the service's comm (probed: ${PROBED_COMMS:-<none>}, runnable: $NTP_PROG_COMM)"
+fi
+
+# ---- case 6: the guard probes the name the SERVICE actually runs as
+#
+# The regression this pins (found in review of PR #648): the probe named the
+# init script (`sysntpd`) instead of the process (`ntpd`), so on real OpenWrt
+# 25.12 the restart never fired. Asserted against the PROG read off the live
+# init script above, not against a literal, so a future rename of the binary
+# is caught here rather than on a customer's router.
+if [ -z "$PROBED_COMMS" ]; then
+    bad "the setup script has no pidof probe to compare (guard removed?)"
+elif [ "$PROBED_COMMS" = "$NTP_PROG_COMM" ]; then
+    ok "every pidof probe in the setup script names the service comm ('$NTP_PROG_COMM', per $NTP_INIT_SCRIPT PROG=$NTP_PROG)"
+else
+    bad "the setup script probes '$(printf '%s' "$PROBED_COMMS" | tr '\n' ' ')' but the service comm is '$NTP_PROG_COMM' (PROG=$NTP_PROG in $NTP_INIT_SCRIPT) — the restart guard is dead on hardware"
 fi
 
 # ---- case 5: a fresh boot (sysntpd not yet started) never touches the init

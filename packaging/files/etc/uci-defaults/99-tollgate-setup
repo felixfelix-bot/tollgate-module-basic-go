@@ -1762,7 +1762,17 @@ setup_ntp_server() {
     if [ "$(uci -q get system.ntp.enable_server 2>/dev/null || echo 0)" != "1" ]; then
         uci set system.ntp.enable_server='1'
     fi
-    if pidof sysntpd >/dev/null 2>&1; then
+    # pidof matches the PROCESS, not the init script: busybox sysntpd runs as
+    # /usr/sbin/ntpd (PROG= at the top of /etc/init.d/sysntpd), so `pidof
+    # sysntpd` never matches on OpenWrt 25.12 and this guard was dead code —
+    # a running router upgraded in place kept its old, non-listening ntpd
+    # until the next interface event or reboot. Measured in
+    # openwrt/rootfs:x86_64-openwrt-25.12: with ntpd live, `pidof sysntpd` is
+    # empty (rc=1) and `pidof ntpd` returns the pid.
+    # `/etc/init.d/sysntpd running` is NOT a substitute: rc.common's running()
+    # is a procd/ubus query (procd_running), so it reports "not running" for a
+    # live-but-unregistered ntpd — the very case this guard has to catch.
+    if pidof ntpd >/dev/null 2>&1; then
         /etc/init.d/sysntpd restart >/dev/null 2>&1 || true
     fi
 }
