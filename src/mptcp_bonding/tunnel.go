@@ -218,6 +218,43 @@ func (c *Config) TunnelConfigFiles() map[string]string {
 	return files
 }
 
+// TunnelFirewallScript renders the firewall acceptance the tunnel interfaces
+// need.
+//
+// WHY THIS IS REQUIRED and not optional: on OpenWrt's fw4 the input chain ends
+// in `jump handle_reject`, and only interfaces explicitly listed (br-lan, lan1,
+// br-private) are accepted. A WireGuard tunnel interface is in none of those, so
+// its traffic is REJECTED. Measured on device, the peer saw the router actively
+// refuse:
+//
+//	10.99.98.1 > 10.99.98.2: ICMP echo request
+//	10.99.98.2 > 10.99.98.1: ICMP unreachable
+//
+// The tunnel transport was perfect, so this is indistinguishable from a broken
+// tunnel unless the operator knows the firewall is the cause. Rendering the
+// acceptance here means the design is complete rather than requiring an
+// undocumented manual step.
+func (c *Config) TunnelFirewallScript() string {
+	if c == nil || len(c.Tunnels) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("#!/bin/sh\n")
+	b.WriteString("# Accept traffic arriving on the tunnel interfaces.\n")
+	b.WriteString("# fw4's input chain ends in `jump handle_reject` and does not list\n")
+	b.WriteString("# tunnel interfaces, so without this their traffic is rejected -- which\n")
+	b.WriteString("# looks exactly like a broken tunnel.\n")
+	for _, t := range c.Tunnels {
+		// Delete-then-add keeps a repeated reconcile from stacking duplicates.
+		fmt.Fprintf(&b, "nft delete rule inet fw4 input iifname %q comment %q 2>/dev/null || true\n",
+			t.Name, "mptcp-tunnel:"+t.Name)
+		fmt.Fprintf(&b, "nft insert rule inet fw4 input iifname %q accept comment %q\n",
+			t.Name, "mptcp-tunnel:"+t.Name)
+	}
+	return b.String()
+}
+
 // TunnelAddresses returns the tunnel addresses that should be registered as
 // MPTCP subflow endpoints, sorted for stable output.
 //
