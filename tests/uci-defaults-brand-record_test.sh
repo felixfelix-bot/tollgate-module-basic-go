@@ -52,7 +52,14 @@ WRITES="${UCI_WRITES:-/dev/null}"
 quiet=0
 [ "${1:-}" = "-q" ] && { quiet=1; shift; }
 cmd="${1:-}"; shift || true
-state_get() { grep -F -- "$1=" "$STATE" 2>/dev/null | head -n1 | cut -d= -f2-; }
+state_get() {
+    # Exact key first, then any key ending in the requested dotted suffix (so
+    # "brand.token" finds the stored "tollgate.brand.token").
+    v="$(grep -F -- "$1=" "$STATE" 2>/dev/null | head -n1 | cut -d= -f2-)"
+    [ -n "$v" ] || v="$(grep -E -- "\.?$1=" "$STATE" 2>/dev/null | head -n1 | cut -d= -f2-)"
+    [ -n "$v" ] || return 1
+    printf '%s\n' "$v"
+}
 case "$cmd" in
     get)
         v="$(state_get "$1")"
@@ -64,12 +71,14 @@ case "$cmd" in
         kv="$1"
         printf '%s\n' "$kv" >> "$WRITES"
         key="${kv%%=*}"; val="${kv#*=}"
-        # normalise to the last two dotted components, which is how the script reads
-        short="${key##*.}"
-        if grep -qF -- "${short}=" "$STATE" 2>/dev/null; then
-            sed -i "s|^${short}=.*|${short}=${val}|" "$STATE"
+        # Store under the FULL dotted key and resolve reads by suffix, so a write
+        # REPLACES the previous value like a real `uci set` does. Keying on the last
+        # component made a seeded value survive a later write, which silently broke
+        # the precedence case (the file looked like it had won).
+        if grep -qF -- "${key}=" "$STATE" 2>/dev/null; then
+            sed -i "s|^${key}=.*|${key}=${val}|" "$STATE"
         else
-            printf '%s=%s\n' "$short" "$val" >> "$STATE"
+            printf '%s=%s\n' "$key" "$val" >> "$STATE"
         fi
         ;;
     commit|delete|add_list|del_list)
@@ -112,7 +121,7 @@ run() { # run <brandfile-content-or-empty> <uci-brand-record-or-empty> <label>
   : > "$TMP/etc/tollgate/brand"
   [ -n "$file_content" ] && printf '%s\n' "$file_content" > "$TMP/etc/tollgate/brand"
   : > "$TMP/state"; : > "$TMP/writes"
-  [ -n "$uci_brand" ] && printf 'brand=%s\n' "$uci_brand" >> "$TMP/state"
+  [ -n "$uci_brand" ] && printf 'tollgate.brand.token=%s\n' "$uci_brand" >> "$TMP/state"
   UCI_STATE="$TMP/state" UCI_WRITES="$TMP/writes" PATH="$TMP/bin:$PATH" bash "$LIB" 2>/dev/null
 }
 
@@ -154,8 +163,10 @@ case "$OUT" in
 esac
 
 OUT="$(run "net4sats" "" "write-through")"
-if grep -q "tollgate.brand=net4sats" "$TMP/writes" 2>/dev/null; then
-  ok "canonical record written: uci tollgate.brand=net4sats"
+# The record is written the way the module already writes UCI elsewhere — create the
+# section if absent, then set the option (see the tollgate.device precedent).
+if grep -q "^tollgate\.brand\.token=net4sats$" "$TMP/writes" 2>/dev/null; then
+  ok "canonical record written: tollgate.brand.token=net4sats"
 else
   bad "canonical record was NOT written (writes: $(tr '\n' ' ' < "$TMP/writes"))"
 fi
@@ -170,7 +181,7 @@ esac
 
 # ...and when the canonical record exists and agrees, we do not rewrite it every run.
 run "net4sats" "net4sats" "idempotent" >/dev/null
-n=$(grep -c "tollgate.brand=" "$TMP/writes" 2>/dev/null | head -1); n=${n:-0}
+n=$(grep -c "tollgate\.brand\.token=" "$TMP/writes" 2>/dev/null | head -1); n=${n:-0}
 if [ "$n" -le 1 ]; then
   ok "write-through is idempotent (wrote the record $n time(s))"
 else

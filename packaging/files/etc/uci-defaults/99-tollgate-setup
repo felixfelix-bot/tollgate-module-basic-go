@@ -400,11 +400,22 @@ setup_marker_decision() {
 # from the value — a nine-character brand collapsed to a four-character
 # fragment and coerced to the default.
 load_brand() {
-    # [ -r ] guard, not redirection with 2>/dev/null: BusyBox ash prints
-    # "can't open …" for the failed redirect itself before the null-stderr
-    # of the command applies (seen live in the alpha4-pre15 postinst).
-    BRAND=""
-    [ -r /etc/tollgate/brand ] && read -r BRAND < /etc/tollgate/brand
+    # PRECEDENCE: canonical UCI record > build-input file > default 'tollgate'.
+    #
+    # The UCI record is AUTHORITATIVE. `/etc/tollgate/brand` is a build INPUT
+    # (supplied by whoever built or is deploying the router); this script reads it
+    # as the fallback and then WRITES IT THROUGH to UCI once, so every later run
+    # and every other consumer sees one canonical answer and the file becomes
+    # advisory. This is the only writer of the record anywhere in the tree.
+    BRAND="$(uci -q get tollgate.brand.token 2>/dev/null || true)"
+    _brand_from_file=0
+    if [ -z "$BRAND" ]; then
+        # [ -r ] guard, not redirection with 2>/dev/null: BusyBox ash prints
+        # "can't open …" for the failed redirect itself before the null-stderr
+        # of the command applies (seen live in the alpha4-pre15 postinst).
+        [ -r /etc/tollgate/brand ] && read -r BRAND < /etc/tollgate/brand
+        _brand_from_file=1
+    fi
     case "$BRAND" in
         # A brand reaches a hostname and an SSID: one alphanumeric token only.
         # Anything else — an empty file, stray whitespace, punctuation — is not
@@ -423,6 +434,17 @@ load_brand() {
         tollgate) BRAND_HOSTNAME="TollGate" ;;
         *) BRAND_HOSTNAME="$(printf '%s' "${BRAND%"${BRAND#?}"}" | tr 'a-z' 'A-Z')${BRAND#?}" ;;
     esac
+
+    # Persist the build input as the canonical record, exactly once. Deliberately
+    # NOT written when the brand is only the default: an absent brand must leave
+    # NO record behind, so an unbranded router stays byte-identical to today and a
+    # later upgrade can still introduce a brand.
+    if [ "$_brand_from_file" = 1 ] && [ "$BRAND" != "tollgate" ]; then
+        uci -q get tollgate.brand >/dev/null 2>&1 || uci set tollgate.brand='brand'
+        uci set tollgate.brand.token="$BRAND"
+        uci commit tollgate
+        log "Brand record written through to UCI (tollgate.brand.token='${BRAND}')"
+    fi
 }
 
 # The brand token this router runs, lowercased — the spelling a machine-written
@@ -433,6 +455,10 @@ load_brand() {
 # behave exactly like the default build.
 brand_token() {
     local brand="${BRAND:-}"
+    if [ -z "$brand" ]; then
+        # Same precedence as load_brand: the canonical UCI record, then the file.
+        brand="$(uci -q get tollgate.brand.token 2>/dev/null || true)"
+    fi
     if [ -z "$brand" ]; then
         # [ -r ] guard, see load_brand above: a failed redirect is reported by
         # the shell itself, before the command's `2>/dev/null` can apply.
