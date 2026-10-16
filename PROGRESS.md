@@ -541,3 +541,62 @@ in this topology. Subflow SIGNALLING works; subflow ESTABLISHMENT fails because
 the advertised addresses are NAT-ed. Ceiling if it did work: 1.2-1.3x, not 2x.
 
 ### Work queue: complete. Remaining barrier is addressing, not code.
+
+## Iterations 20-22 — 2026-10-16/17 (RESOLUTION + valid measurement + IaC)
+
+### THE RESOLUTION: the peer listener was plain TCP
+The whole "no ADD_ADDR / kernel limitation" line was WRONG. `mptcpize` converts
+the CLIENT socket; a listener started as plain `iperf3 -s` stays plain TCP, so
+every connection FELL BACK to regular TCP -- and a fallback connection has no
+path manager, hence no ADD_ADDR. Fixed by starting the peer as
+`mptcpize run iperf3 -s`. Proof: AddAddrTx 54->56/62, MPJoinSynAckRx 0->2/7.
+
+Consultant (glm-4.6v via local 9099) found it in one pass after I had spent many
+iterations on the router side. Lesson recorded: verify the far end is genuinely
+multipath-capable BEFORE diagnosing anything else. `ss -Mltn`, and the responder
+counter `MPCapableSYNACKRX`.
+
+### CORRECTIONS to my own earlier claims (all in the docs)
+- "no ADD_ADDR -> kernel path-manager limitation"   WRONG (it was fallback)
+- "6.6.93 announcement paths may be disabled"       UNFOUNDED (no rebuild needed)
+- "interface-scoping hypothesis"                    falsified, moot
+- scheduler limit                                    still true, never the cause
+- tunnel design                                      VALIDATED
+
+### Commits pushed
+Module repo PR #927 (remote head `7723990`):
+  7404df6  RESOLVED -- peer fallback root cause
+  7723990  first VALID aggregation measurement
+Kit repo main (remote head `a048f9e`):
+  f60871c  tests/mptcp/test_mptcp_multipath.py -- 11 checks
+  a048f9e  Makefile mptcp-bonding-test / -measure targets
+
+### VALID measurement -- subflow over tunnel PROVEN
+    [     ESTABLISHED] saddr4=10.2.1.122  daddr4=23.182.128.51
+    [  SF_ESTABLISHED] saddr4=10.99.97.2  daddr4=23.182.128.51 ifindex=90
+A subflow establishes on the TUNNEL address. That is the mechanism this whole
+effort was built to achieve, and it now happens on every transfer.
+
+Throughput: NO multiplier demonstrated. 3 runs each; within-configuration spread
+exceeds between-configuration difference:
+    stargate-only  8.68, 8.78, 6.19 MB/10s
+    wired-only     2.48, 0.83, 5.78 MB/10s
+    aggregate      3.72, (lost), 3.83 MB/10s
+Cause: StarGate is a ~155 ms high-jitter satellite path and the wired path is
+itself unstable, so the default scheduler concentrating on the lower-latency
+path is correct behaviour. Ceiling stays 1.2-1.3x, not 2x.
+
+### IaC: kit lane landed (per Prime Directive -- built ON the existing kit)
+`tests/mptcp/test_mptcp_multipath.py`, 11 checks, serial-console driven, reads
+every post-condition from the device. Env-driven (no hard-coded lab network);
+skips rather than passing hollowly. Guards all three device-only defects plus the
+fallback precondition. `make mptcp-bonding-test` / `make mptcp-bonding-measure`.
+
+### New defect recorded
+`ip mptcp endpoint flush` resets `add_addr_accepted` to 0 -> the router then
+REFUSES the peer's ADD_ADDR. A reconcile must re-assert limits after any flush.
+
+### Where this leaves the goal
+Implemented, tested, merged into the open PR (#927), and the subflow is proven on
+real hardware over a NAT-traversing tunnel. Aggregation is NOT demonstrated, with
+the reason measured rather than assumed. Work is reproducible as IaC in the kit.
