@@ -188,6 +188,39 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Tunnels must be pinnable. There is no per-peer source-address binding in
+	// wg (verified: `wg set ... bind` -> "Invalid argument: bind"), so pinning
+	// requires a mark, a gateway and a dedicated table. A tunnel missing any of
+	// them would silently follow the default route -- producing a bond that
+	// connects twice through the SAME uplink, which looks configured but buys
+	// nothing.
+	for i, t := range c.Tunnels {
+		if strings.TrimSpace(t.Name) == "" {
+			return fmt.Errorf("mptcp_bonding: tunnel %d has no name", i)
+		}
+		if strings.TrimSpace(t.Interface) == "" {
+			return fmt.Errorf("mptcp_bonding: tunnel %s has no interface", t.Name)
+		}
+		if strings.TrimSpace(t.PeerHost) == "" || t.PeerPort == 0 {
+			return fmt.Errorf("mptcp_bonding: tunnel %s needs a peer host and port", t.Name)
+		}
+		if strings.TrimSpace(t.PeerPubKey) == "" {
+			return fmt.Errorf("mptcp_bonding: tunnel %s has no peer public key", t.Name)
+		}
+		if strings.TrimSpace(t.Address) == "" {
+			return fmt.Errorf("mptcp_bonding: tunnel %s has no address", t.Name)
+		}
+		if t.FwMark == 0 {
+			return fmt.Errorf("mptcp_bonding: tunnel %s has no fwmark; it could not be pinned to its uplink", t.Name)
+		}
+		if strings.TrimSpace(t.Gateway) == "" {
+			return fmt.Errorf("mptcp_bonding: tunnel %s has no gateway; it could not be pinned to its uplink", t.Name)
+		}
+		if t.Table == 0 {
+			return fmt.Errorf("mptcp_bonding: tunnel %s has no routing table; it could not be pinned to its uplink", t.Name)
+		}
+	}
+
 	return nil
 }
 
