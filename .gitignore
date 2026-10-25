@@ -84,3 +84,9 @@ tests/cloud-lab/matrix-wallets/
 tests/cloud-lab/zoo-mint-config.json
 ulw-*.md
 vendor/
+
+# session scratch (review prompts + PR body are session artifacts, not deliverables)
+PR-BODY.md
+PROGRESS.md
+build-review-prompt*.py
+src/cmd/tollgate-cvm/tollgate-cvm
