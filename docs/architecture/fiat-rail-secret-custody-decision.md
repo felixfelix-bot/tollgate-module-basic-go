@@ -65,6 +65,14 @@ for **datasets**.
   (`sqlite3 <db> ".backup <tmp>"` — never copy a live SQLite file), encrypt
   client-side with `age` (or restic), and push to a repository. The passphrase
   lives in OpenBao; the ciphertext never does.
+- **The database is a security asset, not just convenience.** With CDK the
+  spent-proof set lives in the mint DB. Restoring an older snapshot silently
+  **rewinds double-spend protection**: notes spent after the snapshot look
+  unspent again. So the seed alone is not a restore — and a DB rollback is a
+  security event with a value window, not a routine recovery. Keep the RPO
+  small (frequent consistent snapshots), record the snapshot time next to every
+  restore, and if the rollback window is non-trivial, treat it as a keyset-rotation
+  decision rather than pretending the rollback was clean.
 - **3-2-1 still applies:** vault copy + encrypted off-box repository + offline
   escrow of the seed. Any one of the three may be lost without losing the rail.
 - **A backup that was never restored is not a backup.** Required drill, recorded
