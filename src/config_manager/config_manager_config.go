@@ -36,7 +36,21 @@ type Config struct {
 	// ChannelDBPath is REQUIRED when enabled. The rail refuses to start without it
 	// rather than running with an in-memory ledger: a payee that forgets what it was
 	// paid will serve bytes it can never collect for.
-	Spilman SpilmanConfig `json:"spilman,omitempty"`
+	// MaintainerNpub names the Nostr identity that owns this tollgate. It is
+	// the authorization boundary of the CVM control plane: only this npub may
+	// call a state-changing tool over Nostr (see
+	// docs/architecture/cvm-control-plane-decision.md, D3). It is ALSO the
+	// discovery key — the router publishes it in the `p` tag of its kind-11316
+	// announcement, which is how a dashboard finds every tollgate one
+	// maintainer owns without any registry (D4).
+	//
+	// Empty is the "unclaimed" sentinel and is legal: a router that has not
+	// been claimed still serves customers, it just cannot be managed remotely
+	// and does not appear in anyone's fleet view. Anything non-empty must be a
+	// bech32 npub1… key — see ValidateMaintainerNpub for why a raw hex pubkey
+	// is refused rather than normalized.
+	MaintainerNpub string        `json:"maintainer_npub,omitempty"`
+	Spilman        SpilmanConfig `json:"spilman,omitempty"`
 	// Operator-settable network settings. Declared intent: nothing reads these
 	// fields directly. The applier in src/cli/operator_settings.go converges
 	// them onto the router (UCI wireless + the admin-access nft fragment) on
