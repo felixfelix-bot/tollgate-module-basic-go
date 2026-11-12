@@ -385,3 +385,27 @@ func TestIncomingInvoiceCannotGrantTwoPurchases(t *testing.T) {
 		}
 	}
 }
+
+// An actual fee above the reserved fee was never authorised by any budget
+// check: the reserve is what the budget was verified against.
+func TestPaidFeeCannotExceedReserve(t *testing.T) {
+	s, _ := openTest(t)
+	budget := Budget{LimitMSat: 1_000_000}
+	op, e := s.Prepare(intent("fee-bound"), budget)
+	if e != nil {
+		t.Fatal(e)
+	}
+	op, e = s.SubmitOutgoing(op.ID, op.Version, budget)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if op.FeeReserveMSat == 0 {
+		t.Fatal("fixture reserve is zero; test would be vacuous")
+	}
+	if _, e = s.Advance(op.ID, op.Version, Paid, op.FeeReserveMSat+1); e == nil {
+		t.Fatalf("recorded an actual fee of %d above the reserved %d", op.FeeReserveMSat+1, op.FeeReserveMSat)
+	}
+	if _, e = s.Advance(op.ID, op.Version, Paid, op.FeeReserveMSat); e != nil {
+		t.Fatalf("reserved fee rejected: %v", e)
+	}
+}

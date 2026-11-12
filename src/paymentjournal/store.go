@@ -497,6 +497,12 @@ func (s *Store) advanceLocked(id string, version uint64, next State, fee uint64)
 	if !ok || o.Version != version || version == math.MaxUint64 || !allowed(o, next) || fee > math.MaxInt64 || (next != Paid && fee != 0) || (o.Direction == Incoming && fee != 0) {
 		return Operation{}, ErrRefused
 	}
+	// An actual fee may not exceed what was reserved for it: the reserve is the
+	// bound the budget was checked against, so exceeding it means the spend was
+	// never authorised.
+	if next == Paid && o.Direction == Outgoing && fee > o.FeeReserveMSat {
+		return Operation{}, ErrRefused
+	}
 	o.State = next
 	o.Version++
 	o.UpdatedAt = journalEventTime(o, time.Now())
