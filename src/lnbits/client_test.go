@@ -236,16 +236,30 @@ func TestLookupRejectsUnboundOrInconsistentPayment(t *testing.T) {
 		})
 	}
 }
-func TestSendChecksAdminWalletAndDoesNotRetry(t *testing.T) {
+
+// TestSendChecksAdminWalletAndDoesNotRetry previously advertised that it
+// verified the admin-key wallet binding, but its mock always returned the
+// correct wallet, so it still passed with requireSpendingWallet stubbed out.
+// The binding itself is covered by TestWrongAdminWalletNeverSends and
+// TestSendRequiresAdminWalletIDBeforePOST; this test now asserts what it
+// actually proves: the wallet lookup happens before the monetary POST, the
+// send settles, and an invalid invoice never reaches the network.
+func TestSendSettlesAndChecksWalletBeforePosting(t *testing.T) {
 	bolt, hash, pre := testInvoice(t, 21000)
-	var posts atomic.Int32
+	var posts, gets atomic.Int32
 	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Api-Key") != "test-admin-key" {
 			t.Error("wrong admin credential")
 		}
 		if r.Method == "GET" {
+			gets.Add(1)
 			walletJSON(w)
 			return
+		}
+		// The admin wallet lookup must already have happened, otherwise the
+		// spending wallet identity was never verified before this POST.
+		if gets.Load() == 0 {
+			t.Error("monetary POST attempted before the admin wallet lookup")
 		}
 		posts.Add(1)
 		var q map[string]any
@@ -416,6 +430,29 @@ func TestClientFormattingCannotExposeCredentials(t *testing.T) {
 		s := fmt.Sprintf(format, c)
 		if strings.Contains(s, "test-invoice-key") || strings.Contains(s, "test-admin-key") {
 			t.Fatal("client formatting exposes credentials")
+		}
+	}
+}
+
+// Redaction must cover the value form, not just the pointer: a dereferenced
+// Client logged with %v or %+v promoted no String method when it was defined
+// on a pointer receiver, dumping invoiceKey and adminKey verbatim.
+func TestRedactionCoversPointerAndValue(t *testing.T) {
+	c := &Client{walletID: "w1", invoiceKey: "secret-invoice-key", adminKey: "secret-admin-key"}
+	for _, tc := range []struct {
+		name string
+		got  string
+	}{
+		{"pointer %v", fmt.Sprintf("%v", c)},
+		{"pointer %+v", fmt.Sprintf("%+v", c)},
+		{"pointer %#v", fmt.Sprintf("%#v", c)},
+		{"value %v", fmt.Sprintf("%v", *c)},
+		{"value %+v", fmt.Sprintf("%+v", *c)},
+	} {
+		for _, secret := range []string{"secret-invoice-key", "secret-admin-key"} {
+			if strings.Contains(tc.got, secret) {
+				t.Errorf("%s leaked %q: %s", tc.name, secret, tc.got)
+			}
 		}
 	}
 }

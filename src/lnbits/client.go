@@ -351,5 +351,9 @@ func (c *Client) PayInvoice(ctx context.Context, bolt, externalID string) (Payme
 	return p, nil
 }
 
-func (*Client) String() string   { return "LNbits client (credentials redacted)" }
-func (*Client) GoString() string { return "LNbits client (credentials redacted)" }
+// String and GoString are defined on the value receiver so that redaction also
+// covers a dereferenced Client (fmt.Println(*c)); with a pointer receiver the
+// promoted method set omits them for Client values and the struct dump would
+// expose the credentials.
+func (Client) String() string   { return "LNbits client (credentials redacted)" }
+func (Client) GoString() string { return "LNbits client (credentials redacted)" }
