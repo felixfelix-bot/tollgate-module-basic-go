@@ -109,7 +109,7 @@ func TestSubmitOutgoingKeepsUnknownReservationsAcrossPeriods(t *testing.T) {
 	if _, err = s.SubmitOutgoing(b.ID, b.Version, budget); err == nil {
 		t.Fatal("unknown reserve released at period boundary")
 	}
-	if _, err = s.Advance(a.ID, a.Version, Paid, 50); err != nil {
+	if _, err = s.FinalizeOutgoing(a.ID, a.Version, 50, budget); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = s.SubmitOutgoing(b.ID, b.Version, budget); err != nil {
@@ -177,7 +177,7 @@ func TestVerifiedActualFeeOverReserveIsDurableAndExhaustsBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	op, err = s.Advance(op.ID, op.Version, Paid, 101)
+	op, err = s.FinalizeOutgoing(op.ID, op.Version, 101, budget)
 	if err != nil {
 		t.Fatal("verified actual fee above reservation was refused", err)
 	}

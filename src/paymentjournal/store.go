@@ -498,24 +498,29 @@ func (s *Store) FinalizeOutgoing(id string, version uint64, fee uint64, budget B
 	if fee > math.MaxInt64 {
 		return Operation{}, ErrRefused
 	}
-	// outgoingCostLocked counts this operation as amount+reserve. Swap that
-	// reserve contribution for the actual fee and recheck the period limit.
+	// outgoingCostLocked counts this operation as amount+reserve while it is
+	// unresolved. After finalization it is resolved, so its post-transition
+	// contribution follows the same rule that function applies to resolved
+	// sends: excluded entirely when it predates the explicit period start.
 	withdrawing, err := s.outgoingCostLocked(op.WalletID, budget.Since)
 	if err != nil {
 		return Operation{}, ErrRefused
 	}
 	// The operation's own contribution is counted once; remove it entirely and
-	// re-add it with the actual fee so the replacement is measured, not the reserve.
+	// re-add it in its post-transition form so the replacement is measured.
 	own, err := add(op.AmountMSat, op.FeeReserveMSat)
 	if err != nil || withdrawing < own {
 		return Operation{}, ErrRefused
 	}
 	others := withdrawing - own
-	total, err := add(others, op.AmountMSat)
-	if err != nil {
-		return Operation{}, ErrRefused
+	var settled uint64
+	if budget.Since.IsZero() || !op.CreatedAt.Before(budget.Since) {
+		settled, err = add(op.AmountMSat, fee)
+		if err != nil {
+			return Operation{}, ErrRefused
+		}
 	}
-	total, err = add(total, fee)
+	total, err := add(others, settled)
 	if err != nil {
 		return Operation{}, ErrRefused
 	}
@@ -527,11 +532,18 @@ func (s *Store) FinalizeOutgoing(id string, version uint64, fee uint64, budget B
 
 // Advance performs a CAS state transition. It refuses to submit an outgoing
 // operation: outgoing monetary submission has one public route, SubmitOutgoing,
-// which rechecks the current period budget at the point of no return. Incoming
-// submission and reconciliation or terminal transitions remain available.
+// which rechecks the current period budget at the point of no return. It also
+// refuses the outgoing monetary TERMINAL transition to Paid, whose one public
+// route is FinalizeOutgoing: Advance carries no Budget, so allowing it here
+// would record an unbounded ActualFeeMSat that outgoingCostLocked then counts
+// against every later Prepare for the wallet. Incoming submission and
+// reconciliation or terminal transitions remain available.
 func (s *Store) Advance(id string, version uint64, next State, fee uint64) (Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if op, ok := s.data.Operations[id]; ok && op.Direction == Outgoing && next == Paid {
+		return Operation{}, ErrRefused
+	}
 	if op, ok := s.data.Operations[id]; ok && op.Direction == Outgoing && op.State == Prepared && next == Submitted {
 		return Operation{}, ErrRefused
 	}
