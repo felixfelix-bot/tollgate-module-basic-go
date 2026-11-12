@@ -475,75 +475,21 @@ func journalEventTime(o Operation, proposed time.Time) time.Time {
 	return proposed.UTC()
 }
 
-// FinalizeOutgoing is the checked route for the monetary terminal transition of
-// an outgoing operation: it rechecks the period budget with the ACTUAL fee
-// before recording that fee, so a fee that does not fit cannot be written as
-// authoritative. Advance deliberately has no Budget argument, so any caller that
-// reaches Paid through it records an unbounded ActualFeeMSat; outgoingCostLocked
-// counts that number for resolved sends, which would refuse every later Prepare
-// for the wallet.
-//
-// Over-reserve remains representable: a verified actual fee above FeeReserveMSat
-// is accepted whenever AmountMSat+fee still fits the current period limit.
-func (s *Store) FinalizeOutgoing(id string, version uint64, fee uint64, budget Budget) (Operation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ready() != nil {
-		return Operation{}, ErrRefused
-	}
-	op, ok := s.data.Operations[id]
-	if !ok || op.Direction != Outgoing || op.Version != version || !allowed(op, Paid) {
-		return Operation{}, ErrRefused
-	}
-	if fee > math.MaxInt64 {
-		return Operation{}, ErrRefused
-	}
-	// outgoingCostLocked counts this operation as amount+reserve while it is
-	// unresolved. After finalization it is resolved, so its post-transition
-	// contribution follows the same rule that function applies to resolved
-	// sends: excluded entirely when it predates the explicit period start.
-	withdrawing, err := s.outgoingCostLocked(op.WalletID, budget.Since)
-	if err != nil {
-		return Operation{}, ErrRefused
-	}
-	// The operation's own contribution is counted once; remove it entirely and
-	// re-add it in its post-transition form so the replacement is measured.
-	own, err := add(op.AmountMSat, op.FeeReserveMSat)
-	if err != nil || withdrawing < own {
-		return Operation{}, ErrRefused
-	}
-	others := withdrawing - own
-	var settled uint64
-	if budget.Since.IsZero() || !op.CreatedAt.Before(budget.Since) {
-		settled, err = add(op.AmountMSat, fee)
-		if err != nil {
-			return Operation{}, ErrRefused
-		}
-	}
-	total, err := add(others, settled)
-	if err != nil {
-		return Operation{}, ErrRefused
-	}
-	if total > budget.LimitMSat {
-		return Operation{}, ErrRefused
-	}
-	return s.advanceLocked(id, version, Paid, fee)
-}
-
 // Advance performs a CAS state transition. It refuses to submit an outgoing
 // operation: outgoing monetary submission has one public route, SubmitOutgoing,
-// which rechecks the current period budget at the point of no return. It also
-// refuses the outgoing monetary TERMINAL transition to Paid, whose one public
-// route is FinalizeOutgoing: Advance carries no Budget, so allowing it here
-// would record an unbounded ActualFeeMSat that outgoingCostLocked then counts
-// against every later Prepare for the wallet. Incoming submission and
-// reconciliation or terminal transitions remain available.
+// which rechecks the current period budget at the point of no return. Incoming
+// submission and reconciliation or terminal transitions remain available.
+//
+// The terminal transition to Paid records the fee the authority reported, and it
+// must never be refused for exceeding the period budget: spend that already
+// happened is a fact, and understating it lets the next payment overspend the
+// real limit. The fee is still bounded to a plausible amount, because
+// outgoingCostLocked counts ActualFeeMSat for resolved sends and an absurd value
+// would refuse every later Prepare for the wallet. Budget headroom constrains
+// the NEXT payment, not the record of the last one.
 func (s *Store) Advance(id string, version uint64, next State, fee uint64) (Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if op, ok := s.data.Operations[id]; ok && op.Direction == Outgoing && next == Paid {
-		return Operation{}, ErrRefused
-	}
 	if op, ok := s.data.Operations[id]; ok && op.Direction == Outgoing && op.State == Prepared && next == Submitted {
 		return Operation{}, ErrRefused
 	}
@@ -600,12 +546,34 @@ func (s *Store) outgoingCostLocked(walletID string, since time.Time) (uint64, er
 	return total, nil
 }
 
+// A reported fee must be bounded by something an authority could actually
+// report, independent of the period budget. The journal records spend that
+// already happened, so the budget must not veto the record — but an unbounded
+// value would poison the wallet's cost accounting permanently, so a fee is held
+// to a plausible ceiling relative to the payment it settles.
+func plausibleFee(o Operation, next State, fee uint64) bool {
+	if next != Paid {
+		return true
+	}
+	if o.Direction != Outgoing {
+		return true
+	}
+	// A routing fee cannot plausibly exceed the principal plus any reserve the
+	// caller already committed. This rejects sentinel/overflow values without
+	// refusing a real over-reserve.
+	ceiling, err := add(o.AmountMSat, o.FeeReserveMSat)
+	if err != nil {
+		return false
+	}
+	return fee <= ceiling
+}
+
 func (s *Store) advanceLocked(id string, version uint64, next State, fee uint64) (Operation, error) {
 	if s.ready() != nil {
 		return Operation{}, ErrRefused
 	}
 	o, ok := s.data.Operations[id]
-	if !ok || o.Version != version || version == math.MaxUint64 || !allowed(o, next) || fee > math.MaxInt64 || (next != Paid && fee != 0) || (o.Direction == Incoming && fee != 0) {
+	if !ok || o.Version != version || version == math.MaxUint64 || !allowed(o, next) || !plausibleFee(o, next, fee) || (next != Paid && fee != 0) || (o.Direction == Incoming && fee != 0) {
 		return Operation{}, ErrRefused
 	}
 	o.State = next
