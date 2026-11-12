@@ -475,6 +475,56 @@ func journalEventTime(o Operation, proposed time.Time) time.Time {
 	return proposed.UTC()
 }
 
+// FinalizeOutgoing is the checked route for the monetary terminal transition of
+// an outgoing operation: it rechecks the period budget with the ACTUAL fee
+// before recording that fee, so a fee that does not fit cannot be written as
+// authoritative. Advance deliberately has no Budget argument, so any caller that
+// reaches Paid through it records an unbounded ActualFeeMSat; outgoingCostLocked
+// counts that number for resolved sends, which would refuse every later Prepare
+// for the wallet.
+//
+// Over-reserve remains representable: a verified actual fee above FeeReserveMSat
+// is accepted whenever AmountMSat+fee still fits the current period limit.
+func (s *Store) FinalizeOutgoing(id string, version uint64, fee uint64, budget Budget) (Operation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ready() != nil {
+		return Operation{}, ErrRefused
+	}
+	op, ok := s.data.Operations[id]
+	if !ok || op.Direction != Outgoing || op.Version != version || !allowed(op, Paid) {
+		return Operation{}, ErrRefused
+	}
+	if fee > math.MaxInt64 {
+		return Operation{}, ErrRefused
+	}
+	// outgoingCostLocked counts this operation as amount+reserve. Swap that
+	// reserve contribution for the actual fee and recheck the period limit.
+	withdrawing, err := s.outgoingCostLocked(op.WalletID, budget.Since)
+	if err != nil {
+		return Operation{}, ErrRefused
+	}
+	// The operation's own contribution is counted once; remove it entirely and
+	// re-add it with the actual fee so the replacement is measured, not the reserve.
+	own, err := add(op.AmountMSat, op.FeeReserveMSat)
+	if err != nil || withdrawing < own {
+		return Operation{}, ErrRefused
+	}
+	others := withdrawing - own
+	total, err := add(others, op.AmountMSat)
+	if err != nil {
+		return Operation{}, ErrRefused
+	}
+	total, err = add(total, fee)
+	if err != nil {
+		return Operation{}, ErrRefused
+	}
+	if total > budget.LimitMSat {
+		return Operation{}, ErrRefused
+	}
+	return s.advanceLocked(id, version, Paid, fee)
+}
+
 // Advance performs a CAS state transition. It refuses to submit an outgoing
 // operation: outgoing monetary submission has one public route, SubmitOutgoing,
 // which rechecks the current period budget at the point of no return. Incoming
