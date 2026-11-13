@@ -109,6 +109,39 @@ func TestOverLimitSpendSurvivesReopen(t *testing.T) {
 	}
 }
 
+// The ceiling alone is not a sufficient bound: AmountMSat and FeeReserveMSat are
+// each capped at MaxInt64, so the sum can reach 2^64-2, which is itself above
+// MaxInt64. Recording a fee that large writes an ActualFeeMSat the recovery
+// validator rejects, so the journal file can never be opened again — a durable
+// denial of the whole store. This is why the MaxInt64 bound must be kept
+// alongside the plausibility ceiling.
+func TestAdvanceNeverRecordsFeeAboveMaxInt64(t *testing.T) {
+	s, dir := openTest(t)
+	o := Operation{ID: "max-fee", WalletID: "wallet-a", Direction: Outgoing, Recipient: "r",
+		PaymentHash: "000000000000000000000000000000000000000000000000000000000000000b",
+		AmountMSat:  math.MaxInt64, FeeReserveMSat: math.MaxInt64}
+	op, err := s.Prepare(o, Budget{LimitMSat: math.MaxUint64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op, err = s.SubmitOutgoing(op.ID, op.Version, Budget{LimitMSat: math.MaxUint64}); err != nil {
+		t.Fatal(err)
+	}
+	fee := uint64(math.MaxInt64) * 2 // 2^64-2: within the ceiling, above MaxInt64
+	if _, err = s.Advance(op.ID, op.Version, Paid, fee); err == nil {
+		t.Fatalf("recorded ActualFeeMSat=%d (> MaxInt64); the journal is now unopenable", fee)
+	}
+	// The store must remain openable: a rejected fee must not brick the file.
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Open(dir)
+	if err != nil {
+		t.Fatalf("journal bricked by a rejected fee: %v", err)
+	}
+	defer again.Close()
+}
+
 // Incoming operations are unaffected by the outgoing fee ceiling.
 func TestIncomingTerminalUnaffectedByFeeCeiling(t *testing.T) {
 	s, _ := openTest(t)

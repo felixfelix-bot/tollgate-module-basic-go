@@ -551,9 +551,19 @@ func (s *Store) outgoingCostLocked(walletID string, since time.Time) (uint64, er
 // already happened, so the budget must not veto the record — but an unbounded
 // value would poison the wallet's cost accounting permanently, so a fee is held
 // to a plausible ceiling relative to the payment it settles.
+//
+// The MaxInt64 bound is required alongside the ceiling, not implied by it:
+// AmountMSat and FeeReserveMSat are each capped at MaxInt64, so their sum can
+// reach 2^64-2. Recording an ActualFeeMSat above MaxInt64 produces a snapshot the
+// recovery validator rejects, and Open then fails forever — the whole journal
+// becomes unreadable. A fee that cannot be represented in a reopenable snapshot
+// must be refused before it is written.
 func plausibleFee(o Operation, next State, fee uint64) bool {
 	if next != Paid {
 		return true
+	}
+	if fee > math.MaxInt64 {
+		return false
 	}
 	if o.Direction != Outgoing {
 		return true
