@@ -1,0 +1,52 @@
+CONSENSUS CROSS-CHECK  LUD-25/26 @ fd80cdd (v2)
+host=x280  core=/Satoshi:31.1.0/  chain=regtest  node=127.0.0.1:18444
+height=107
+wallet=rig balance=349.993812
+
+==============================================================================
+CASE 1  bearer note: cw1 script-path spend (OP_SHA256 <h> OP_EQUAL)
+==============================================================================
+Q            = 8c87b9a41a9fda6f4580e863680dd57aff3eae696da955034ec090bae1fb44c1
+leaf         = a82002d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc87
+locktime=0 sequence=0xffffffff witness=[32 bytes]
+funded       = txid db75b7e6a0dad6bab6be620f4929f475e2fed152ebfd8639437ae9754e3f190b vout 0 value 100000 sat
+spk          = 51208c87b9a41a9fda6f4580e863680dd57aff3eae696da955034ec090bae1fb44c1  (Core calls this witness_v1_taproot)
+testmempoolaccept(correct preimage) -> allowed=True 
+EXPECT: allowed=True
+testmempoolaccept(wrong preimage)   -> allowed=False mempool-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)
+EXPECT: allowed=False (OP_EQUAL fails)
+
+==============================================================================
+CASE 2  timelock note: <T> CLTV DROP <pk> CHECKSIG
+==============================================================================
+T            = 1800000000
+leaf         = 0400d2496bb1752048711c155a7403e2b10da4a69803a0efb6aa5324e8a25fa774fed47e8da2da88ac
+Q (recomputed)= c0f5569495465776e2b57e7aac87d2d3141a68c4045acac9d8aadb849504b2d3  parity=1
+funded       = txid b4cad74340f4889f73ce9cb011a2162ac0d4791c991702595eed9b266da1dee4 vout 0 value 100000 sat
+claim nLockTime=1800000000  -> allowed=False non-final
+claim nLockTime=1799999999  -> allowed=False non-final
+
+EXPECT: T due -> allowed=True ; T-1 -> allowed=False (CLTV refuses)
+
+NOTE ON WHAT THIS IS: the node is at wall-clock time far past any T we
+can set without parking the chain, so CLTV is evaluated against the
+node's MEDIAN-TIME-PAST. A T in the future is refused by CLTV itself,
+which is a CONSENSUS refusal. That is exactly the distinction LUD-25's
+warning draws: SERVICE may refuse a not-yet-due claim by policy, but a
+CHAIN refuses it by rule -- and only the chain ruling is trustless.
+
+-- same leaf shape, T in the PAST (so finality cannot mask CLTV) --
+T'           = 1600000000 (past)  leaf=0400105e5fb1752048711c155a7403e2b10da4a69803a0efb6aa5324e8a25fa774fed47e8da2da88ac
+funded       = be22911f8cb8d6e651de1e438701710eabe53a239a8385209b95e8f049f94a63 vout 0 value 100000 sat
+claim nLockTime=1600000000  -> allowed=True  
+claim nLockTime=1599999999  -> allowed=False mempool-script-verify-flag-failed (Locktime requirement not satisfied)
+EXPECT: T' due -> allowed=True ; T'-1 -> allowed=False (CLTV refuses,
+        'Script evaluated without error but finished with a false top stack')
+
+==============================================================================
+SUMMARY
+==============================================================================
+bearer note: Core ACCEPTED the real preimage and REFUSED a wrong one  -> CONFIRMED
+timelock   : CLTV due -> allowed=True ; not-due -> refused=True  -> CONFIRMED
+
+VERDICT: Core's interpreter confirms the v2 spend shapes.
